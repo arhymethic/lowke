@@ -40,10 +40,16 @@ The multi-camera pipeline processes sequential CCTV feeds along a highway corrid
   $$\text{Timestamp}_{\text{frame}} = \text{VirtualStartTime} + \left(\frac{\text{frame\_idx}}{\text{fps}}\right) \times 1\text{s}$$
   $$\text{Speed } (v) = \frac{\text{Distance}_{A \to B}}{\Delta t} \times 3.6 \quad (\text{km/h})$$
 * **Quick Start**:
-  ```bash
-  cd Unreal
-  python multi_cam_reid.py
-  ```
+  * **Linux / macOS**:
+    ```bash
+    ./run_unreal.sh
+    # or: cd Unreal && ./run.sh
+    ```
+  * **Windows**:
+    ```cmd
+    run_unreal.bat
+    :: or: cd Unreal && run.bat
+    ```
 
 ---
 
@@ -51,6 +57,7 @@ The multi-camera pipeline processes sequential CCTV feeds along a highway corrid
 
 A high-performance surveillance simulation and computer vision workstation built with Pygame, OpenCV, and NumPy, tuned to run at 30–60 FPS:
 * **Corridor Geometry**: 2000m multi-lane corridor with 4 sequential cameras (`CAM 01` to `CAM 04`) and 250m unmonitored blind spots.
+* **Camera Controls**: Disable or enable any camera on the fly with keyboard keys `1`, `2`, `3`, `4` or clicking the monitor headers without breaking target tracking continuity.
 * **5-Parameter AI Re-ID**:
   1. Visual Reference Photo Match (NCC & HSV correlation)
   2. Outer Chassis Color Histogram
@@ -58,10 +65,16 @@ A high-performance surveillance simulation and computer vision workstation built
   4. Speed Vector / Optical Displacement Radar
   5. Position Prediction (In-camera Kalman Filter + Blind-spot transit countdown)
 * **Quick Start**:
-  ```bash
-  cd sim
-  ./run.sh
-  ```
+  * **Linux / macOS**:
+    ```bash
+    ./run_sim.sh
+    # or: cd sim && ./run.sh
+    ```
+  * **Windows**:
+    ```cmd
+    run_sim.bat
+    :: or: cd sim && run.bat
+    ```
 
 ---
 

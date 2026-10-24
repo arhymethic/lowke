@@ -35,6 +35,7 @@ Usage:
 import os
 import sys
 import time
+import platform
 import argparse
 from collections import defaultdict
 import cv2
@@ -43,6 +44,10 @@ import torch
 import torch.nn as nn
 from torchvision import models, transforms
 from ultralytics import YOLO
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+if SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, SCRIPT_DIR)
 
 # ==============================================================================
 # 1. TOP-LEVEL CONFIGURATION REGISTRY
@@ -71,7 +76,7 @@ CONFIG = {
     "FEATURE_UPDATE_INTERVAL": 15,    # Extract heavy deep embedding every N frames per tracklet
 
     # Output & Canvas Specifications
-    "OUTPUT_PATH": os.path.join("output", "final_showcase.mp4"),
+    "OUTPUT_PATH": os.path.join(SCRIPT_DIR, "output", "final_showcase.mp4"),
     "CANVAS_WIDTH": 1920,
     "CANVAS_HEIGHT": 1080,
     "OUTPUT_FPS": 25.0,
@@ -120,29 +125,35 @@ def get_vehicle_color(global_id: str) -> tuple:
 def resolve_model_path(model_name: str) -> str:
     """Finds YOLO model weights in models/ or workspace root."""
     candidates = [
+        os.path.join(SCRIPT_DIR, "models", model_name),
+        os.path.join(SCRIPT_DIR, model_name),
         os.path.join("models", model_name),
         model_name,
+        os.path.join(SCRIPT_DIR, "models", "yolov8n.pt"),
+        os.path.join(SCRIPT_DIR, "models", "yolov8s.pt"),
         os.path.join("models", "yolov8n.pt"),
-        "yolov8n.pt",
-        os.path.join("models", "yolov8s.pt"),
-        "yolov8s.pt"
+        os.path.join("models", "yolov8s.pt")
     ]
     for c in candidates:
         if os.path.exists(c):
             return c
-    return os.path.join("models", model_name)
+    return os.path.join(SCRIPT_DIR, "models", model_name)
 
 def resolve_camera_source(specified_path: str, fallback_idx: int) -> str:
     """Resolves video source across designated folders."""
     if os.path.exists(specified_path):
         return specified_path
     candidates = [
+        os.path.join(SCRIPT_DIR, specified_path),
+        os.path.join(SCRIPT_DIR, "videos", specified_path),
+        os.path.join(SCRIPT_DIR, "videos", f"cam{fallback_idx}.mp4"),
+        os.path.join(SCRIPT_DIR, "SAMPLE OUTPUTS", f"final_showcase{fallback_idx}.mp4"),
+        os.path.join(SCRIPT_DIR, "SAMPLE OUTPUTS", "final_showcase.mp4"),
+        os.path.join(SCRIPT_DIR, "output", "final_showcase.mp4"),
         os.path.join("videos", specified_path),
         os.path.join("videos", f"cam{fallback_idx}.mp4"),
-        os.path.join("videos", f"vdo ({fallback_idx}).avi"),
-        os.path.join("videos", "cam1.mp4"),
         f"cam{fallback_idx}.mp4",
-        f"vdo ({fallback_idx}).avi"
+        os.path.join("SAMPLE OUTPUTS", "final_showcase.mp4")
     ]
     for c in candidates:
         if os.path.exists(c):
@@ -1219,7 +1230,7 @@ def main():
     configure_pipeline(args)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[*] Compute Device: {device} | Architecture: Windows x64")
+    print(f"[*] Compute Device: {device} | OS: {platform.system()} ({platform.machine()})")
     print(f"[*] Configured Cameras: {len(CONFIG['cameras'])}")
     for c in CONFIG["cameras"]:
         print(f"    - {c['cam_id']}: {c.get('resolved_path', c['path'])}")

@@ -4,6 +4,7 @@ Aesthetic: Professional Late-90s / 2000s Industrial Law Enforcement Surveillance
 Fully Adaptive: Dynamically scales to any resolution (1280x720, 1600x900, 1920x1080) with pygame.RESIZABLE.
 """
 
+import os
 import sys
 import time
 import argparse
@@ -11,10 +12,14 @@ import pygame
 import cv2
 import numpy as np
 
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+if SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, SCRIPT_DIR)
+
 from sim_world import SimWorld
 from cv_tracker import AITrackerWorld
 from hud_overlay import HUDOverlay
-from tiny_car_net import COLOR_NAMES, DRIVER_NAMES, STICKER_NAMES
+from tiny_car_net import COLOR_NAMES, DRIVER_NAMES
 
 
 def train_tiny_car_net_live(ai_tracker, sim_world):
