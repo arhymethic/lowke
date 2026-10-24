@@ -68,23 +68,30 @@ def train_tiny_car_net_live(ai_tracker, sim_world):
 
 
 def auto_lock_next_cam01_car(ai_tracker, sim_world):
-    """Pick car currently inside CAM 01 coverage (0m-250m) and lock onto it."""
-    cam01_cars = [c for c in sim_world.cars if 15.0 < c.x < 180.0]
-    if cam01_cars:
-        chosen = max(cam01_cars, key=lambda c: c.x)
+    """Pick car currently inside the first available enabled camera coverage and lock onto it."""
+    cam_targets = [i for i in range(4) if sim_world.cam_enabled[i]]
+    if not cam_targets:
+        ai_tracker.log("All cameras offline. Enable a camera to auto-lock.")
+        return
+        
+    cam_idx = cam_targets[0]
+    cam_x = sim_world.cam_x_centers[cam_idx]
+    cam_cars = [c for c in sim_world.cars if abs(c.x - cam_x) < 95.0]
+    if cam_cars:
+        chosen = max(cam_cars, key=lambda c: c.x)
         sim_world.render_cctv_views()
-        raw_rgb = pygame.surfarray.array3d(sim_world.cam_surfs[0]).transpose(1, 0, 2)
+        raw_rgb = pygame.surfarray.array3d(sim_world.cam_surfs[cam_idx]).transpose(1, 0, 2)
         frame_bgr = cv2.cvtColor(raw_rgb, cv2.COLOR_RGB2BGR)
         
         cos30 = 0.866025
         sin30 = 0.5
-        off_x = 160.0 - 125.0 * cos30
-        off_y = 120.0 - 125.0 * sin30
+        off_x = 160.0 - cam_x * cos30
+        off_y = 120.0 - cam_x * sin30
         click_x = int((chosen.x - chosen.lane_offset) * cos30 + off_x)
         click_y = int((chosen.x + chosen.lane_offset) * sin30 + off_y)
-        ai_tracker.lock_target(0, click_x, click_y, frame_bgr, target_id=chosen.id_str, override_center=(click_x, click_y), target_car=chosen)
+        ai_tracker.lock_target(cam_idx, click_x, click_y, frame_bgr, target_id=chosen.id_str, override_center=(click_x, click_y), target_car=chosen)
     else:
-        ai_tracker.log("No cars currently in CAM 01 entry. Waiting...")
+        ai_tracker.log(f"No cars currently in CAM 0{cam_idx + 1}. Waiting...")
 
 
 def main():
@@ -154,6 +161,14 @@ def main():
                     auto_lock_next_cam01_car(ai_tracker, sim_world)
                 elif event.key == pygame.K_u:
                     ai_tracker.unlock_target()
+                elif event.key in (pygame.K_1, pygame.K_KP1):
+                    sim_world.toggle_camera(0)
+                elif event.key in (pygame.K_2, pygame.K_KP2):
+                    sim_world.toggle_camera(1)
+                elif event.key in (pygame.K_3, pygame.K_KP3):
+                    sim_world.toggle_camera(2)
+                elif event.key in (pygame.K_4, pygame.K_KP4):
+                    sim_world.toggle_camera(3)
                     
             # Pass events to HUD (sliders, buttons, and resize)
             action = hud.handle_event(event)
@@ -167,19 +182,23 @@ def main():
                 ai_tracker.flag_wrong_car()
             elif action == "unlock":
                 ai_tracker.unlock_target()
+            elif action and action.startswith("toggle_cam_"):
+                cam_idx = int(action.split("_")[-1])
+                sim_world.toggle_camera(cam_idx)
                 
-            # Click on CCTV feeds to lock target
+            # Click on CCTV feeds to lock target (only if camera is active)
             if not action and event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                 click_info = hud.get_cctv_click(event.pos)
                 if click_info is not None:
                     cid, lx, ly = click_info
-                    clicked_car, best_u, best_v = sim_world.get_car_at_screen_pos(cid, lx, ly)
-                    raw_rgb = pygame.surfarray.array3d(sim_world.cam_surfs[cid]).transpose(1, 0, 2)
-                    frame_bgr = cv2.cvtColor(raw_rgb, cv2.COLOR_RGB2BGR)
-                    
-                    t_id = clicked_car.id_str if clicked_car else None
-                    center_pt = (best_u, best_v) if clicked_car else (lx, ly)
-                    ai_tracker.lock_target(cid, lx, ly, frame_bgr, target_id=t_id, override_center=center_pt, target_car=clicked_car)
+                    if sim_world.cam_enabled[cid]:
+                        clicked_car, best_u, best_v = sim_world.get_car_at_screen_pos(cid, lx, ly)
+                        raw_rgb = pygame.surfarray.array3d(sim_world.cam_surfs[cid]).transpose(1, 0, 2)
+                        frame_bgr = cv2.cvtColor(raw_rgb, cv2.COLOR_RGB2BGR)
+                        
+                        t_id = clicked_car.id_str if clicked_car else None
+                        center_pt = (best_u, best_v) if clicked_car else (lx, ly)
+                        ai_tracker.lock_target(cid, lx, ly, frame_bgr, target_id=t_id, override_center=center_pt, target_car=clicked_car)
                     
         # Synchronize All AI Model Hyperparameters with AI Tracker
         ai_tracker.cfg_reid_threshold = hud.slider_reid_thresh.val
@@ -213,7 +232,7 @@ def main():
         # 3. Pixel Extraction into BGR NumPy arrays
         # -------------------------------------------------------------
         for i in range(4):
-            if ai_tracker.active_cam is None or i == ai_tracker.active_cam or i == ai_tracker.expecting_cam or ai_tracker.tracker_state == "AWAITING RE-ID":
+            if sim_world.cam_enabled[i] and (ai_tracker.active_cam is None or i == ai_tracker.active_cam or i == ai_tracker.expecting_cam or ai_tracker.tracker_state == "AWAITING RE-ID"):
                 raw_rgb = pygame.surfarray.array3d(sim_world.cam_surfs[i]).transpose(1, 0, 2)
                 cam_frames_bgr[i] = cv2.cvtColor(raw_rgb, cv2.COLOR_RGB2BGR)
                 

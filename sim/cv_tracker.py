@@ -13,7 +13,7 @@ import math
 import cv2
 import numpy as np
 
-from tiny_car_net import TinyCarNet, COLOR_NAMES, DRIVER_NAMES, STICKER_NAMES
+from tiny_car_net import TinyCarNet, COLOR_NAMES, DRIVER_NAMES
 
 
 def project_car_iso(car, cam_x):
@@ -515,9 +515,56 @@ class AITrackerWorld:
         )
         return float(total_score), cand_prof
 
+    def _find_next_enabled_cam(self, from_cam, cam_enabled):
+        """Find the next enabled camera along the corridor (0 ➔ 1 ➔ 2 ➔ 3 ➔ 0)."""
+        for step in range(1, 5):
+            c = (from_cam + step) % 4
+            if cam_enabled[c]:
+                return c
+        return None
+
+    def _find_next_enabled_cam_from_pos(self, corridor_x, cam_enabled):
+        """Find the nearest upcoming enabled camera ahead of corridor_x."""
+        entries = [0.0, 500.0, 1000.0, 1500.0]
+        best_cam = None
+        min_dist = float("inf")
+        for cid in range(4):
+            if cam_enabled[cid]:
+                dist = (entries[cid] - corridor_x) % 2000.0
+                if dist < min_dist:
+                    min_dist = dist
+                    best_cam = cid
+        return best_cam
+
     def process_cameras(self, cam_frames_bgr, sim_time, contrast_val=0.0, weather_val=0.0, time_val=0.0, sim_world=None):
         self.update_dynamic_weights(contrast_val, weather_val, time_val)
         
+        # Immediate handover if the currently active camera was disabled by operator
+        if self.active_cam is not None and sim_world is not None and not sim_world.cam_enabled[self.active_cam]:
+            cur_cam = self.active_cam
+            nxt_cam = self._find_next_enabled_cam(cur_cam, sim_world.cam_enabled)
+            self.expecting_cam = nxt_cam
+            self.tracker_state = self.STATE_TRANSIT
+            self.transit_start_time = sim_time
+            self.transit_est_speed_m_s = max(14.0, self.p_speed_kmh / 3.6)
+            
+            cur_pos = self.locked_car.x if self.locked_car is not None else self.sim_corridor_x
+            if nxt_cam is not None:
+                entry_x = [0.0, 500.0, 1000.0, 1500.0][nxt_cam]
+                dist_to_next = (entry_x - cur_pos) % 2000.0
+                if dist_to_next <= 0.0:
+                    dist_to_next = 2000.0
+                self.transit_eta = dist_to_next / self.transit_est_speed_m_s
+                self.log(f"CAMERA 0{cur_cam + 1} OFFLINE ➔ PREDICTION ENGINE ADVANCING TARGET TO CAM 0{nxt_cam + 1} (ETA: {self.transit_eta:.1f}s)")
+            else:
+                self.transit_eta = 0.0
+                self.log("ALL CAMERAS OFFLINE ➔ PREDICTION ENGINE CONTINUOUS CORRIDOR DEAD-RECKONING")
+                
+            self.active_cam = None
+            if self.target_id in self.target_registry:
+                st = f"IN TRANSIT ➔ CAM 0{nxt_cam + 1}" if nxt_cam is not None else "DEAD RECKONING"
+                self.target_registry[self.target_id]["status"] = st
+
         # -------------------------------------------------------------
         # Case A: Actively tracking target inside camera
         # -------------------------------------------------------------
@@ -604,49 +651,71 @@ class AITrackerWorld:
                         is_exit = True
 
             if is_exit:
-                nxt_cam = self.NEXT_CAM[self.active_cam]
+                cur_cam = self.active_cam
+                nxt_cam = self.NEXT_CAM[cur_cam]
+                if sim_world is not None and not sim_world.cam_enabled[nxt_cam]:
+                    nxt_cam = self._find_next_enabled_cam(cur_cam, sim_world.cam_enabled)
+                    
                 self.expecting_cam = nxt_cam
                 self.tracker_state = self.STATE_TRANSIT
                 self.transit_start_time = sim_time
                 self.transit_est_speed_m_s = max(14.0, self.p_speed_kmh / 3.6)
-                self.transit_eta = self.GAP_DISTANCE_METERS / self.transit_est_speed_m_s
+                
+                cur_pos = self.locked_car.x if self.locked_car is not None else self.sim_corridor_x
+                if nxt_cam is not None:
+                    entry_x = [0.0, 500.0, 1000.0, 1500.0][nxt_cam]
+                    dist_to_next = (entry_x - cur_pos) % 2000.0
+                    if dist_to_next <= 0.0:
+                        dist_to_next = 2000.0
+                    self.transit_eta = dist_to_next / self.transit_est_speed_m_s
+                else:
+                    self.transit_eta = 0.0
                 
                 if self.target_id in self.target_registry:
-                    self.target_registry[self.target_id]["status"] = f"IN TRANSIT ➔ CAM 0{nxt_cam + 1}"
+                    st = f"IN TRANSIT ➔ CAM 0{nxt_cam + 1}" if nxt_cam is not None else "DEAD RECKONING"
+                    self.target_registry[self.target_id]["status"] = st
                     
-                self.log(f"TARGET #{self.target_id} EXITED CAM 0{self.active_cam + 1} ➔ BLIND SPOT GAP")
-                self.log(f"Gap: 250m | ETA to CAM 0{nxt_cam + 1}: {self.transit_eta:.1f}s")
+                self.log(f"TARGET #{self.target_id} EXITED CAM 0{cur_cam + 1} ➔ BLIND SPOT GAP")
+                if nxt_cam is not None:
+                    self.log(f"Predicting Corridor Transit to CAM 0{nxt_cam + 1} | ETA: {self.transit_eta:.1f}s")
                 self.active_cam = None
 
         # -------------------------------------------------------------
-        # Case B: In Blind Spot or Awaiting Re-Identification
+        # Case B: In Blind Spot, Disabled Camera Corridor, or Re-Identification
         # -------------------------------------------------------------
         elif self.target_id is not None and self.target_crop is not None and self.tracker_state not in [self.STATE_LOCKED, self.STATE_COASTING]:
-            if self.tracker_state == self.STATE_TRANSIT and self.expecting_cam is not None:
-                elapsed = sim_time - self.transit_start_time
-                self.transit_progress_meters = min(self.GAP_DISTANCE_METERS, elapsed * self.transit_est_speed_m_s)
-                rem_dist = max(0.0, self.GAP_DISTANCE_METERS - self.transit_progress_meters)
-                self.transit_eta = max(0.0, rem_dist / max(1.0, self.transit_est_speed_m_s))
-                
-                prev_cam = (self.expecting_cam - 1) % 4
-                gap_start_x = [250.0, 750.0, 1250.0, 1750.0][prev_cam]
-                self.sim_corridor_x = gap_start_x + self.transit_progress_meters
-                
-                # If transit ETA expired, transition to active corridor search instead of dropping target!
-                if elapsed > (self.GAP_DISTANCE_METERS / self.transit_est_speed_m_s) + 6.0:
-                    self.tracker_state = "AWAITING RE-ID"
-                    if self.target_id in self.target_registry:
-                        self.target_registry[self.target_id]["status"] = "CORRIDOR SEARCH: AWAITING RE-APPEARANCE"
-                        
-            # Scan camera feeds: While in transit, ONLY scan the expecting camera
-            # This completely prevents downstream cameras (e.g. CAM 04) from stealing the target
-            if self.tracker_state == self.STATE_TRANSIT:
-                cams_to_scan = [self.expecting_cam] if self.expecting_cam is not None else [0]
+            # Maintain corridor location prediction with 100% continuity
+            if self.locked_car is not None:
+                self.sim_corridor_x = self.locked_car.x
             else:
-                cams_to_scan = [self.expecting_cam] if self.expecting_cam is not None else []
-                for cid in range(4):
-                    if cid not in cams_to_scan:
-                        cams_to_scan.append(cid)
+                self.sim_corridor_x = (self.sim_corridor_x + self.transit_est_speed_m_s * (1.0 / 30.0)) % 2000.0
+                
+            # If expecting camera was disabled, bypass to next enabled camera
+            if sim_world is not None:
+                if self.expecting_cam is not None and not sim_world.cam_enabled[self.expecting_cam]:
+                    self.expecting_cam = self._find_next_enabled_cam(self.expecting_cam, sim_world.cam_enabled)
+                elif self.expecting_cam is None:
+                    self.expecting_cam = self._find_next_enabled_cam_from_pos(self.sim_corridor_x, sim_world.cam_enabled)
+
+            # Update live countdown ETA to the upcoming active camera
+            if self.expecting_cam is not None:
+                entry_x = [0.0, 500.0, 1000.0, 1500.0][self.expecting_cam]
+                rem_dist = (entry_x - self.sim_corridor_x) % 2000.0
+                self.transit_eta = max(0.0, rem_dist / max(1.0, self.transit_est_speed_m_s))
+                if self.target_id in self.target_registry:
+                    self.target_registry[self.target_id]["status"] = f"IN TRANSIT ➔ CAM 0{self.expecting_cam + 1} (ETA: {self.transit_eta:.1f}s)"
+            else:
+                self.transit_eta = 0.0
+                if self.target_id in self.target_registry:
+                    self.target_registry[self.target_id]["status"] = "ALL CAMS OFFLINE: DEAD RECKONING"
+
+            # Scan ONLY enabled cameras that are expecting the vehicle
+            if self.expecting_cam is not None:
+                cams_to_scan = [self.expecting_cam]
+            else:
+                cams_to_scan = []
+            if sim_world is not None:
+                cams_to_scan = [c for c in cams_to_scan if sim_world.cam_enabled[c]]
                     
             best_match_cam = None
             best_match_box = None

@@ -159,6 +159,7 @@ class SimWorld:
         
         # 4 Pygame camera surfaces (320x240)
         self.cam_surfs = [pygame.Surface((320, 240)) for _ in range(4)]
+        self.cam_enabled = [True, True, True, True]
         
         # Active traffic
         self.cars = []
@@ -298,10 +299,63 @@ class SimWorld:
             int(color[2] * dark_factor),
         )
 
+    def toggle_camera(self, cam_idx):
+        if 0 <= cam_idx < 4:
+            self.cam_enabled[cam_idx] = not self.cam_enabled[cam_idx]
+            return self.cam_enabled[cam_idx]
+        return False
+
+    def set_camera_enabled(self, cam_idx, enabled):
+        if 0 <= cam_idx < 4:
+            self.cam_enabled[cam_idx] = bool(enabled)
+
+    def _render_camera_offline(self, surf, cam_idx):
+        """Renders authentic CCTV signal loss screen with analog raster scanlines."""
+        surf.fill((16, 20, 24))
+        
+        # Subtle analog scanlines
+        for y in range(0, 240, 4):
+            pygame.draw.line(surf, (24, 30, 36), (0, y), (320, y), 1)
+            
+        # Vintage static speckles
+        for _ in range(45):
+            rx = random.randint(0, 319)
+            ry = random.randint(0, 239)
+            b = random.randint(40, 80)
+            surf.set_at((rx, ry), (b, b, b))
+            
+        # Centered Warning Box
+        box_w, box_h = 240, 94
+        bx = (320 - box_w) // 2
+        by = (240 - box_h) // 2
+        pygame.draw.rect(surf, (24, 30, 38), (bx, by, box_w, box_h))
+        pygame.draw.rect(surf, (180, 50, 50), (bx, by, box_w, box_h), 1)
+        
+        # Header banner
+        pygame.draw.rect(surf, (180, 40, 40), (bx + 2, by + 2, box_w - 4, 20))
+        font = pygame.font.Font(None, 18)
+        font_sm = pygame.font.Font(None, 16)
+        
+        t_loss = font.render(f"NO SIGNAL ── CH-0{cam_idx + 1} OFFLINE", True, (255, 255, 255))
+        surf.blit(t_loss, (bx + (box_w - t_loss.get_width()) // 2, by + 5))
+        
+        t_sub = font_sm.render("CAMERA SENSOR FEED DISCONNECTED", True, (220, 225, 230))
+        surf.blit(t_sub, (bx + (box_w - t_sub.get_width()) // 2, by + 28))
+        
+        t_ai = font_sm.render("PREDICTION ENGINE: ONLINE (TRACKING)", True, (60, 240, 140))
+        surf.blit(t_ai, (bx + (box_w - t_ai.get_width()) // 2, by + 48))
+        
+        t_hint = font_sm.render(f"Press Key [{cam_idx + 1}] or Click [ON/OFF] to restore", True, (160, 180, 200))
+        surf.blit(t_hint, (bx + (box_w - t_hint.get_width()) // 2, by + 70))
+
     def render_cctv_views(self):
         """Render all 4 Project Zomboid style CCTV cameras at high FPS."""
         for cam_idx in range(4):
             surf = self.cam_surfs[cam_idx]
+            if not self.cam_enabled[cam_idx]:
+                self._render_camera_offline(surf, cam_idx)
+                continue
+                
             cam_x = self.cam_x_centers[cam_idx]
             
             off_x = 160.0 - cam_x * COS_30
@@ -339,6 +393,9 @@ class SimWorld:
         Accurately find which car was clicked inside this camera viewport.
         Returns (car, screen_u, screen_v) or (None, click_x, click_y).
         """
+        if not self.cam_enabled[cam_idx]:
+            return None, click_x, click_y
+            
         cam_x = self.cam_x_centers[cam_idx]
         off_x = 160.0 - cam_x * COS_30
         off_y = 120.0 - cam_x * SIN_30

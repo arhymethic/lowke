@@ -250,9 +250,14 @@ class HUDOverlay:
             vy = sy + 20 + (slot_h - 24 - c_h) // 2
             c_rect = pygame.Rect(vx, vy, c_w, c_h)
             
+            # Power toggle button in the header
+            pwr_w, pwr_h = 56, 16
+            pwr_rect = pygame.Rect(sx + slot_w - pwr_w - 4, sy + 3, pwr_w, pwr_h)
+            
             self.cctv_slots.append({
                 "id": i, "name": names[i],
                 "rect": s_rect, "cam_rect": c_rect,
+                "pwr_rect": pwr_rect,
                 "scale": cam_scale
             })
             
@@ -328,6 +333,13 @@ class HUDOverlay:
             if b.handle_event(event):
                 return b.tag
                 
+        # Camera power toggle button clicks
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            for slot in self.cctv_slots:
+                pr = slot.get("pwr_rect")
+                if pr and pr.collidepoint(event.pos):
+                    return f"toggle_cam_{slot['id']}"
+
         # Bottom corridor buttons
         for b in self.buttons:
             if b.handle_event(event):
@@ -392,15 +404,35 @@ class HUDOverlay:
             pygame.draw.rect(screen, (34, 40, 48), (sr.x + 2, sr.y + 2, sr.width - 4, 18))
             draw_3d_bevel(screen, (sr.x + 2, sr.y + 2, sr.width - 4, 18), raised=True)
             
+            is_enabled = sim_world.cam_enabled[cid]
+            pwr_rect = slot.get("pwr_rect", pygame.Rect(sr.x + sr.width - 60, sr.y + 3, 56, 16))
+            
             # LED indicator dot
-            led_col = (255, 30, 30) if blink else (130, 20, 20)
+            if is_enabled:
+                led_col = (255, 30, 30) if blink else (130, 20, 20)
+            else:
+                led_col = (65, 70, 75)
             pygame.draw.circle(screen, led_col, (sr.x + 10, sr.y + 11), 3)
             
-            txt_cam = self.font_medium.render(slot["name"], True, (220, 230, 240))
+            txt_cam = self.font_medium.render(slot["name"], True, (220, 230, 240) if is_enabled else (135, 145, 155))
             screen.blit(txt_cam, (sr.x + 18, sr.y + 4))
             
-            # Status Badge
-            if ai_tracker.active_cam == cid:
+            # Interactive Power Toggle Button [PWR: ON] / [PWR: OFF]
+            pwr_bg = (24, 62, 42) if is_enabled else (68, 26, 26)
+            pwr_border = (52, 195, 105) if is_enabled else (195, 62, 62)
+            pwr_txt_col = (185, 255, 215) if is_enabled else (255, 175, 175)
+            pwr_label = f"[{cid+1}] ON" if is_enabled else f"[{cid+1}] OFF"
+            
+            draw_3d_bevel(screen, pwr_rect, raised=is_enabled, fill_color=pwr_bg)
+            pygame.draw.rect(screen, pwr_border, pwr_rect, 1)
+            t_pwr = self.font_tiny.render(pwr_label, True, pwr_txt_col)
+            screen.blit(t_pwr, (pwr_rect.x + (pwr_rect.width - t_pwr.get_width()) // 2, pwr_rect.y + 2))
+            
+            # Status Badge (positioned left of power button)
+            if not is_enabled:
+                badge_str = "[FEED OFFLINE]"
+                badge_col = (255, 95, 95)
+            elif ai_tracker.active_cam == cid:
                 if ai_tracker.tracker_state == ai_tracker.STATE_COASTING:
                     badge_str = "[★ BRIDGE OCCLUSION]"
                     badge_col = (245, 215, 30)
@@ -415,7 +447,7 @@ class HUDOverlay:
                 badge_col = (130, 145, 160)
                 
             txt_badge = self.font_tiny.render(badge_str, True, badge_col)
-            screen.blit(txt_badge, (sr.x + sr.width - txt_badge.get_width() - 8, sr.y + 4))
+            screen.blit(txt_badge, (pwr_rect.x - txt_badge.get_width() - 8, sr.y + 4))
             
             # Video Viewport (Sunken CRT/LCD screen)
             draw_3d_bevel(screen, (cr.x - 2, cr.y - 2, cr.width + 4, cr.height + 4), raised=False, fill_color=(0, 0, 0))
@@ -428,8 +460,11 @@ class HUDOverlay:
             else:
                 screen.blit(raw_cam, (cr.x, cr.y))
                 
-            # Classic OSD Timestamp inside video feed (CCTV green)
-            osd_txt = self.font_osd.render(f"LIVE {t_now} | 1080i/30fps", True, (80, 255, 120))
+            # Classic OSD Timestamp inside video feed (CCTV green or offline red)
+            if is_enabled:
+                osd_txt = self.font_osd.render(f"LIVE {t_now} | 1080i/30fps", True, (80, 255, 120))
+            else:
+                osd_txt = self.font_osd.render("FEED DISABLED | PREDICTION ENGINE RUNNING", True, (255, 110, 110))
             screen.blit(osd_txt, (cr.x + 4, cr.y + cr.height - 15))
             
             # Reticle, Trajectory & Hierarchical Sub-Part Tracking in Active Cam
@@ -505,10 +540,11 @@ class HUDOverlay:
             
             if ai_tracker.tracker_state == ai_tracker.STATE_TRANSIT:
                 col = (255, 195, 45)
-                t_str = f"▼ #{ai_tracker.target_id} [TRANSIT ETA: {ai_tracker.transit_eta:.1f}s]"
+                nxt = f"CAM 0{ai_tracker.expecting_cam + 1}" if ai_tracker.expecting_cam is not None else "DEAD RECKONING"
+                t_str = f"▼ #{ai_tracker.target_id} [TRANSIT ➔ {nxt} | ETA: {ai_tracker.transit_eta:.1f}s]"
             else:
                 col = (40, 255, 130) if ai_tracker.active_cam is not None else (255, 215, 60)
-                loc_txt = f"CAM 0{ai_tracker.active_cam + 1}" if ai_tracker.active_cam is not None else "SEARCHING"
+                loc_txt = f"CAM 0{ai_tracker.active_cam + 1}" if ai_tracker.active_cam is not None else "DEAD RECKONING (DARK SECTOR)"
                 t_str = f"▼ #{ai_tracker.target_id} [{loc_txt}]"
                 
             t_lbl = self.font_small.render(t_str, True, col)
@@ -527,13 +563,18 @@ class HUDOverlay:
         pygame.draw.rect(screen, (16, 20, 24), (tx_start, track_y - 4, track_w, 10))
         draw_3d_bevel(screen, (tx_start, track_y - 4, track_w, 10), raised=False)
         
-        # 4 Camera Monitored Segments (Glowing teal-emerald)
-        cam_spans = [(0, 250, "CAM 01"), (500, 750, "CAM 02"), (1000, 1250, "CAM 03"), (1500, 1750, "CAM 04")]
-        for m_start, m_end, name in cam_spans:
+        # 4 Camera Monitored Segments (Glowing teal-emerald when online, dark red when offline)
+        cam_spans = [(0, 250, "CAM 01", 0), (500, 750, "CAM 02", 1), (1000, 1250, "CAM 03", 2), (1500, 1750, "CAM 04", 3)]
+        for m_start, m_end, name, c_idx in cam_spans:
             px_s = tx_start + int((m_start / 2000.0) * track_w)
             px_e = tx_start + int((m_end / 2000.0) * track_w)
-            pygame.draw.rect(screen, (40, 150, 130), (px_s, track_y - 3, px_e - px_s, 8))
-            pygame.draw.rect(screen, (80, 240, 200), (px_s, track_y - 1, px_e - px_s, 2))
+            is_en = sim_world.cam_enabled[c_idx]
+            if is_en:
+                pygame.draw.rect(screen, (40, 150, 130), (px_s, track_y - 3, px_e - px_s, 8))
+                pygame.draw.rect(screen, (80, 240, 200), (px_s, track_y - 1, px_e - px_s, 2))
+            else:
+                pygame.draw.rect(screen, (60, 28, 28), (px_s, track_y - 3, px_e - px_s, 8))
+                pygame.draw.rect(screen, (160, 60, 60), (px_s, track_y - 1, px_e - px_s, 2))
             
         # 4 Blind-Spot Gap Segments (Subtle amber-slate roadbed)
         gap_spans = [(250, 500, "GAP 1"), (750, 1000, "GAP 2"), (1250, 1500, "GAP 3"), (1750, 2000, "GAP 4 (LOOP)")]
@@ -554,9 +595,12 @@ class HUDOverlay:
             
         # 3. LOWER LANE: Camera Sector Badges
         tag_y = self.corr_rect.y + 88
-        for m_start, m_end, name in cam_spans:
+        for m_start, m_end, name, c_idx in cam_spans:
             px_s = tx_start + int((m_start / 2000.0) * track_w)
-            lbl = self.font_tiny.render(f"[{name}]", True, (80, 240, 200))
+            is_en = sim_world.cam_enabled[c_idx]
+            badge_txt = f"[{name}]" if is_en else f"[{name}: OFF]"
+            badge_col = (80, 240, 200) if is_en else (220, 90, 90)
+            lbl = self.font_tiny.render(badge_txt, True, badge_col)
             screen.blit(lbl, (px_s + 2, tag_y))
             
         for gs, ge, gname in gap_spans:
