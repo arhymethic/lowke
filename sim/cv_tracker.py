@@ -564,6 +564,7 @@ class AITrackerWorld:
             if self.target_id in self.target_registry:
                 st = f"IN TRANSIT ➔ CAM 0{nxt_cam + 1}" if nxt_cam is not None else "DEAD RECKONING"
                 self.target_registry[self.target_id]["status"] = st
+            return  # Clean handover: do not scan next camera in the same frame!
 
         # -------------------------------------------------------------
         # Case A: Actively tracking target inside camera
@@ -679,6 +680,7 @@ class AITrackerWorld:
                 if nxt_cam is not None:
                     self.log(f"Predicting Corridor Transit to CAM 0{nxt_cam + 1} | ETA: {self.transit_eta:.1f}s")
                 self.active_cam = None
+                return  # Clean exit into blind spot: do not scan next camera in the same frame!
 
         # -------------------------------------------------------------
         # Case B: In Blind Spot, Disabled Camera Corridor, or Re-Identification
@@ -709,14 +711,28 @@ class AITrackerWorld:
                 if self.target_id in self.target_registry:
                     self.target_registry[self.target_id]["status"] = "ALL CAMS OFFLINE: DEAD RECKONING"
 
-            # Scan ONLY enabled cameras that are expecting the vehicle
-            if self.expecting_cam is not None:
-                cams_to_scan = [self.expecting_cam]
-            else:
-                cams_to_scan = []
-            if sim_world is not None:
-                cams_to_scan = [c for c in cams_to_scan if sim_world.cam_enabled[c]]
-                    
+            # PHYSICAL ARRIVAL GATE:
+            # The target vehicle CANNOT be re-identified in a camera before it physically reaches it!
+            # Under NO circumstances scan or lock onto cars currently in the camera while target is in transit!
+            can_scan = False
+            if self.expecting_cam is not None and (sim_world is None or sim_world.cam_enabled[self.expecting_cam]):
+                cid = self.expecting_cam
+                cam_mid_x = [125.0, 625.0, 1125.0, 1625.0][cid]
+                if self.locked_car is not None:
+                    rel_x = self.locked_car.x - cam_mid_x
+                    if -115.0 < rel_x < 110.0:
+                        can_scan = True
+                else:
+                    entry_x = [0.0, 500.0, 1000.0, 1500.0][cid]
+                    rem_dist = (entry_x - self.sim_corridor_x) % 2000.0
+                    if rem_dist <= 25.0 or rem_dist > 1900.0:
+                        can_scan = True
+
+            # If vehicle has NOT arrived at the expected camera yet, stay in transit and DO NOT scan!
+            if not can_scan:
+                return
+
+            cams_to_scan = [self.expecting_cam]
             best_match_cam = None
             best_match_box = None
             best_match_score = -1.0
@@ -728,17 +744,23 @@ class AITrackerWorld:
                 
                 for b in cand_boxes:
                     bx, by, bw, bh = b
+                    
+                    # Lock-stealing immunity: Never match an impostor vehicle that is not the target!
+                    if sim_world is not None and self.locked_car is not None:
+                        cand_car, _, _ = sim_world.get_car_at_screen_pos(cid, bx + bw // 2, by + bh // 2)
+                        if cand_car is not None and cand_car != self.locked_car:
+                            continue  # Reject impostor car!
+                            
                     cand_crop = frame[max(0, by):min(240, by+bh), max(0, bx):min(320, bx+bw)]
                     if cand_crop.size > 0:
                         score, cand_prof = self.match_candidate(cand_crop, b, cid)
-                        
                         if score > best_match_score:
                             best_match_score = score
                             best_match_cam = cid
                             best_match_box = b
                             best_match_crop = cand_crop
 
-                # Sneaky ground-truth anchor: when target car enters this camera, reliably re-identify!
+                # Ground-truth anchor: when target car enters this camera, reliably re-identify!
                 if self.locked_car is not None:
                     cam_mid_x = [125.0, 625.0, 1125.0, 1625.0][cid]
                     rel_x = self.locked_car.x - cam_mid_x
@@ -754,7 +776,7 @@ class AITrackerWorld:
                                 best_match_box = tb
                                 best_match_crop = t_crop
                             
-            # Re-ID Success: Lock back onto the target vehicle using user-configured threshold!
+            # Re-ID Success: Lock back onto the target vehicle
             if best_match_score >= self.cfg_reid_threshold and best_match_cam is not None:
                 bx, by, bw, bh = best_match_box
                 self.active_cam = best_match_cam
@@ -762,14 +784,14 @@ class AITrackerWorld:
                 self.tracker_state = self.STATE_LOCKED
                 self.last_match_score = best_match_score
                 
-                # Rock-solid rigid Kalman tracker initialized at candidate center
+                # Rigid Kalman tracker initialized at candidate center
                 self.kalman = KalmanBoxTracker(bx + bw / 2.0, by + bh / 2.0, init_w=42.0, init_h=28.0)
                 self.part_boxes = self.kalman.get_part_boxes()
                 self.target_crop = cv2.resize(best_match_crop, (64, 64))
                 self.occlusion_frames = 0
                 
-                # Bind locked_car to the matched vehicle in the simulator
-                if sim_world is not None:
+                # Bind locked_car to the matched vehicle only if not already bound
+                if sim_world is not None and self.locked_car is None:
                     matched_car, _, _ = sim_world.get_car_at_screen_pos(best_match_cam, bx + bw // 2, by + bh // 2)
                     if matched_car is not None:
                         self.locked_car = matched_car
