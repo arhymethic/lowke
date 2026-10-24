@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=Project Zomboid CCTV Tracker
+Comment=Highway Corridor Vehicle Re-ID & Multi-Attribute Tracking Workstation
+Exec=/home/rhythm/Projects/Lowke/sim/run.sh
+Path=/home/rhythm/Projects/Lowke/sim
+Terminal=false
+Type=Application
+Categories=Development;Science;

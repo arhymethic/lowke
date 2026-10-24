@@ -1,0 +1,25 @@
+# Python & Virtual Environments
+.venv/
+venv/
+**/__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Videos
+*.mp4
+*.avi
+*.mkv
+*.mov
+videos/
+real/videos/
+
+# IDE & OS Artifacts
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
