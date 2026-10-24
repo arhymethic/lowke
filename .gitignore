@@ -7,13 +7,20 @@ venv/
 *.so
 .Python
 
-# Videos
+# Videos (Raw heavy videos ignored)
 *.mp4
 *.avi
 *.mkv
 *.mov
 videos/
 real/videos/
+
+# Tracked Camera Feeds & Output Showcase Videos
+!real/cam1.mp4
+!real/cam2.mp4
+!real/cam3.mp4
+!real/stitched_output.mp4
+!real/final_showcase.mp4
 
 # IDE & OS Artifacts
 .vscode/
