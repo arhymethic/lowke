@@ -8,14 +8,15 @@ A unified computer vision and simulation suite for sequential multi-camera vehic
 
 ```
 Lowke/
-├── real/                      # Real-world video Re-ID pipeline & HUD telemetry
+├── Unreal/                    # Video Re-ID pipeline & HUD telemetry
 │   ├── config.json            # Camera registry, virtual start timestamps, and distance matrix
+│   ├── configs/               # Configuration settings
+│   ├── models/                # YOLOv8 weights (yolov8n.pt, yolov8s.pt)
 │   ├── multi_cam_reid.py      # Multi-camera YOLOv8 Re-ID tracking engine
+│   ├── output/                # Processed output showcase videos
 │   ├── requirements.txt       # Dependencies (ultralytics, opencv, torch, etc.)
-│   ├── run.sh                 # Linux / macOS runner script
 │   ├── run.bat                # Windows runner script
-│   ├── yolov8n.pt             # YOLOv8 Nano weights
-│   ├── yolov8s.pt             # YOLOv8 Small weights
+│   ├── SAMPLE OUTPUTS/        # Showcase sample outputs
 │   └── README.md              # Pipeline documentation & mathematical formulas
 │
 └── sim/                       # Real-time highway corridor CCTV simulation & CV tracker
@@ -31,17 +32,17 @@ Lowke/
 
 ---
 
-## 1. Real Pipeline (`real/`)
+## 1. Unreal Pipeline (`Unreal/`)
 
-The real-world pipeline processes multiple sequential CCTV feeds along a highway corridor:
+The multi-camera pipeline processes sequential CCTV feeds along a highway corridor:
 * **Detection & Re-ID**: Powered by YOLOv8 with bounding box feature matching and spatial-temporal constraints.
 * **Corridor Telemetry**: Accurately computes frame-to-global timestamps and average section speeds:
   $$\text{Timestamp}_{\text{frame}} = \text{VirtualStartTime} + \left(\frac{\text{frame\_idx}}{\text{fps}}\right) \times 1\text{s}$$
   $$\text{Speed } (v) = \frac{\text{Distance}_{A \to B}}{\Delta t} \times 3.6 \quad (\text{km/h})$$
 * **Quick Start**:
   ```bash
-  cd real
-  ./run.sh
+  cd Unreal
+  python multi_cam_reid.py
   ```
 
 ---

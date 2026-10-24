@@ -1,0 +1,136 @@
+{
+  "project_name": "Multi-Camera Vehicle Tracking & Speed Registry",
+  "version": "1.0.0",
+  "description": "Registry assigning camera identifiers, video source files, virtual start timestamps, and distance matrices for downstream detection, Re-ID, and kinematics processing.",
+  "metadata": {
+    "speed_unit": "km/h",
+    "distance_unit": "meters",
+    "speed_limit_kmh": 60.0,
+    "timestamp_format": "YYYY-MM-DDTHH:mm:ss.fff"
+  },
+  "camera_order": [
+    "CAM_01",
+    "CAM_02",
+    "CAM_03",
+    "CAM_04",
+    "CAM_05",
+    "CAM_06",
+    "CAM_07",
+    "CAM_08"
+  ],
+  "cameras": {
+    "CAM_01": {
+      "camera_id": "CAM_01",
+      "video_file": "videos/vdo (1).avi",
+      "virtual_start_timestamp": "2026-10-24T10:00:00.000",
+      "duration_sec": 31.0,
+      "estimated_fps": 30.0,
+      "location_name": "Checkpoint 1 - Entry Gate",
+      "description": "Primary inlet corridor camera"
+    },
+    "CAM_02": {
+      "camera_id": "CAM_02",
+      "video_file": "videos/vdo (2).avi",
+      "virtual_start_timestamp": "2026-10-24T10:00:25.000",
+      "duration_sec": 28.0,
+      "estimated_fps": 30.0,
+      "location_name": "Checkpoint 2 - Sector A Junction",
+      "description": "Mid-corridor camera"
+    },
+    "CAM_03": {
+      "camera_id": "CAM_03",
+      "video_file": "videos/vdo (3).avi",
+      "virtual_start_timestamp": "2026-10-24T10:01:00.000",
+      "duration_sec": 41.0,
+      "estimated_fps": 30.0,
+      "location_name": "Checkpoint 3 - Main Avenue South",
+      "description": "High-traffic avenue camera"
+    },
+    "CAM_04": {
+      "camera_id": "CAM_04",
+      "video_file": "videos/vdo (4).avi",
+      "virtual_start_timestamp": "2026-10-24T10:01:40.000",
+      "duration_sec": 46.0,
+      "estimated_fps": 30.0,
+      "location_name": "Checkpoint 4 - Central Flyover Entrance",
+      "description": "Elevated road transition camera"
+    },
+    "CAM_05": {
+      "camera_id": "CAM_05",
+      "video_file": "videos/vdo (5).avi",
+      "virtual_start_timestamp": "2026-10-24T10:02:25.000",
+      "duration_sec": 47.0,
+      "estimated_fps": 30.0,
+      "location_name": "Checkpoint 5 - Flyover Midpoint",
+      "description": "Speed enforcement zone camera"
+    },
+    "CAM_06": {
+      "camera_id": "CAM_06",
+      "video_file": "videos/vdo (6).avi",
+      "virtual_start_timestamp": "2026-10-24T10:03:10.000",
+      "duration_sec": 31.0,
+      "estimated_fps": 30.0,
+      "location_name": "Checkpoint 6 - Sector B Underpass",
+      "description": "Descent road camera"
+    },
+    "CAM_07": {
+      "camera_id": "CAM_07",
+      "video_file": "videos/vdo (7).avi",
+      "virtual_start_timestamp": "2026-10-24T10:03:45.000",
+      "duration_sec": 31.0,
+      "estimated_fps": 30.0,
+      "location_name": "Checkpoint 7 - Commercial Zone Outlet",
+      "description": "Urban transition camera"
+    },
+    "CAM_08": {
+      "camera_id": "CAM_08",
+      "video_file": "videos/vdo (8).avi",
+      "virtual_start_timestamp": "2026-10-24T10:04:20.000",
+      "duration_sec": 60.0,
+      "estimated_fps": 30.0,
+      "location_name": "Checkpoint 8 - Exit Toll Plaza",
+      "description": "Terminal corridor camera"
+    },
+    "CAM_MASTER": {
+      "camera_id": "CAM_MASTER",
+      "video_file": "videos/vdo.avi",
+      "virtual_start_timestamp": "2026-10-24T10:00:00.000",
+      "duration_sec": 211.0,
+      "estimated_fps": 30.0,
+      "location_name": "Master Surveillance Stream",
+      "description": "Continuous master feed / composite clip"
+    }
+  },
+  "distance_matrix_meters": {
+    "CAM_01": {
+      "CAM_02": 350.0
+    },
+    "CAM_02": {
+      "CAM_03": 500.0
+    },
+    "CAM_03": {
+      "CAM_04": 450.0
+    },
+    "CAM_04": {
+      "CAM_05": 400.0
+    },
+    "CAM_05": {
+      "CAM_06": 350.0
+    },
+    "CAM_06": {
+      "CAM_07": 300.0
+    },
+    "CAM_07": {
+      "CAM_08": 500.0
+    }
+  },
+  "spatio_temporal_travel_limits": {
+    "CAM_01->CAM_02": { "min_travel_sec": 10.0, "max_travel_sec": 90.0, "distance_m": 350.0 },
+    "CAM_02->CAM_03": { "min_travel_sec": 15.0, "max_travel_sec": 120.0, "distance_m": 500.0 },
+    "CAM_03->CAM_04": { "min_travel_sec": 12.0, "max_travel_sec": 110.0, "distance_m": 450.0 },
+    "CAM_04->CAM_05": { "min_travel_sec": 10.0, "max_travel_sec": 100.0, "distance_m": 400.0 },
+    "CAM_05->CAM_06": { "min_travel_sec": 10.0, "max_travel_sec": 90.0, "distance_m": 350.0 },
+    "CAM_06->CAM_07": { "min_travel_sec": 8.0,  "max_travel_sec": 80.0,  "distance_m": 300.0 },
+    "CAM_07->CAM_08": { "min_travel_sec": 15.0, "max_travel_sec": 120.0, "distance_m": 500.0 }
+  }
+}

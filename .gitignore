@@ -7,20 +7,22 @@ venv/
 *.so
 .Python
 
-# Videos (Raw heavy videos ignored)
+# Local real/ folder ignored from git
+real/
+
+# Heavy video files ignored by default
 *.mp4
 *.avi
 *.mkv
 *.mov
 videos/
-real/videos/
+Unreal/videos/
 
-# Tracked Camera Feeds & Output Showcase Videos
-!real/cam1.mp4
-!real/cam2.mp4
-!real/cam3.mp4
-!real/stitched_output.mp4
-!real/final_showcase.mp4
+# Allowed showcase/sample output videos in Unreal
+!Unreal/output/
+!Unreal/output/*.mp4
+!Unreal/SAMPLE OUTPUTS/
+!Unreal/SAMPLE OUTPUTS/*.mp4
 
 # IDE & OS Artifacts
 .vscode/
