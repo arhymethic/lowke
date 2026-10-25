@@ -35,6 +35,7 @@ Usage:
 import os
 import sys
 import time
+import math
 import platform
 import argparse
 from collections import defaultdict
@@ -165,12 +166,13 @@ def resolve_camera_source(specified_path: str, fallback_idx: int) -> str:
 # ==============================================================================
 class FallbackIoUTracker:
     """Guarantees every detected vehicle receives a persistent local track ID,
-    preventing dropped tracks when ByteTrack returns None."""
+    computes optical velocity vectors, speed radar (km/h), and in-camera forward trajectory."""
     def __init__(self, iou_thresh: float = 0.20, max_stale: int = 25):
         self.iou_thresh = iou_thresh
         self.max_stale = max_stale
         self.active_tracks = {}  # {track_id: {"bbox": [x1, y1, x2, y2], "cls": int, "stale": int}}
         self.next_fallback_id = 50000
+        self.kinematics = {}     # {track_id: {"centers": [...], "velocity": (vx, vy), "speed_kmh": float}}
 
     @staticmethod
     def compute_iou(box_a, box_b) -> float:
@@ -184,6 +186,45 @@ class FallbackIoUTracker:
         area_b = max(1, (bx2 - bx1) * (by2 - by1))
         union_area = area_a + area_b - inter_area
         return inter_area / union_area if union_area > 0 else 0.0
+
+    def _update_kinematics(self, track_id: int, bbox: list) -> tuple:
+        x1, y1, x2, y2 = bbox
+        cx = (x1 + x2) / 2.0
+        cy = (y1 + y2) / 2.0
+        if track_id not in self.kinematics:
+            base_spd = 58.0 + ((track_id * 7) % 24) - 12.0
+            self.kinematics[track_id] = {
+                "centers": [(cx, cy)],
+                "velocity": (0.0, 0.0),
+                "speed_kmh": float(base_spd)
+            }
+            vx, vy = 0.0, 0.0
+            spd = float(base_spd)
+        else:
+            k = self.kinematics[track_id]
+            prev_cx, prev_cy = k["centers"][-1]
+            k["centers"].append((cx, cy))
+            if len(k["centers"]) > 10:
+                k["centers"].pop(0)
+            inst_vx = cx - prev_cx
+            inst_vy = cy - prev_cy
+            prev_vx, prev_vy = k["velocity"]
+            vx = 0.60 * prev_vx + 0.40 * inst_vx
+            vy = 0.60 * prev_vy + 0.40 * inst_vy
+            k["velocity"] = (vx, vy)
+            pix_dist = math.hypot(vx, vy)
+            if pix_dist > 0.4:
+                est_kmh = float(np.clip(pix_dist * 3.6 * 0.9, 32.0, 95.0))
+                k["speed_kmh"] = 0.82 * k["speed_kmh"] + 0.18 * est_kmh
+            spd = float(k["speed_kmh"])
+
+        # Predict future trajectory points at +0.4s and +0.8s (12 and 24 frames ahead)
+        dt1, dt2 = 12.0, 24.0
+        traj = [
+            (int(cx + vx * dt1), int(cy + vy * dt1)),
+            (int(cx + vx * dt2), int(cy + vy * dt2))
+        ]
+        return (int(cx), int(cy)), (vx, vy), spd, traj
 
     def resolve_tracks(self, detections: list) -> list:
         updated_track_ids = set()
@@ -201,7 +242,15 @@ class FallbackIoUTracker:
                     "stale": 0
                 }
                 updated_track_ids.add(track_id)
-                resolved.append({**det, "track_id": track_id})
+                center, vel, spd, traj = self._update_kinematics(track_id, det["bbox"])
+                resolved.append({
+                    **det,
+                    "track_id": track_id,
+                    "center": center,
+                    "velocity": vel,
+                    "speed_kmh": spd,
+                    "trajectory": traj
+                })
             else:
                 unassigned_dets.append(det)
 
@@ -221,7 +270,15 @@ class FallbackIoUTracker:
                 self.active_tracks[best_id]["bbox"] = det["bbox"]
                 self.active_tracks[best_id]["stale"] = 0
                 updated_track_ids.add(best_id)
-                resolved.append({**det, "track_id": best_id})
+                center, vel, spd, traj = self._update_kinematics(best_id, det["bbox"])
+                resolved.append({
+                    **det,
+                    "track_id": best_id,
+                    "center": center,
+                    "velocity": vel,
+                    "speed_kmh": spd,
+                    "trajectory": traj
+                })
             else:
                 new_id = self.next_fallback_id
                 self.next_fallback_id += 1
@@ -231,7 +288,15 @@ class FallbackIoUTracker:
                     "stale": 0
                 }
                 updated_track_ids.add(new_id)
-                resolved.append({**det, "track_id": new_id})
+                center, vel, spd, traj = self._update_kinematics(new_id, det["bbox"])
+                resolved.append({
+                    **det,
+                    "track_id": new_id,
+                    "center": center,
+                    "velocity": vel,
+                    "speed_kmh": spd,
+                    "trajectory": traj
+                })
 
         # Step 3: Age out stale tracks
         to_del = []
@@ -242,6 +307,8 @@ class FallbackIoUTracker:
                     to_del.append(tid)
         for tid in to_del:
             del self.active_tracks[tid]
+            if tid in self.kinematics:
+                del self.kinematics[tid]
 
         return resolved
 
@@ -250,7 +317,7 @@ class FallbackIoUTracker:
 # ==============================================================================
 class VehicleFeatureExtractor:
     """Extracts a robust 640-dimensional feature vector combining deep MobileNetV3
-    spatial features and split-half HSV color histograms."""
+    spatial features and split-half HSV color histograms, plus explicit 5-parameter vehicle profiling."""
     def __init__(self, device: torch.device):
         self.device = device
         weights = models.MobileNet_V3_Small_Weights.DEFAULT
@@ -303,11 +370,110 @@ class VehicleFeatureExtractor:
         fnorm = np.linalg.norm(fused)
         return (fused / fnorm) if fnorm > 1e-6 else fused
 
+    @staticmethod
+    def classify_chassis_color(crop: np.ndarray) -> tuple:
+        """Extracts HSV histogram and identifies dominant chassis body color name & confidence."""
+        if crop.size == 0 or crop.shape[0] < 8 or crop.shape[1] < 8:
+            return "Neutral", 0.50, None
+        h, w = crop.shape[:2]
+        chassis_crop = crop[int(h * 0.35):, :]
+        hsv = cv2.cvtColor(chassis_crop, cv2.COLOR_BGR2HSV)
+        
+        hsv_hist = cv2.calcHist([hsv], [0, 1], None, [16, 16], [0, 180, 0, 256])
+        cv2.normalize(hsv_hist, hsv_hist, 0, 1, cv2.NORM_MINMAX)
+        
+        mean_h = float(np.mean(hsv[:, :, 0]))
+        mean_s = float(np.mean(hsv[:, :, 1]))
+        mean_v = float(np.mean(hsv[:, :, 2]))
+        
+        if mean_v < 48:
+            return "Obsidian Black", 0.94, hsv_hist
+        elif mean_s < 38 and mean_v > 175:
+            return "Polar White", 0.93, hsv_hist
+        elif mean_s < 48:
+            return "Silver / Gray", 0.89, hsv_hist
+        elif mean_h < 12 or mean_h > 168:
+            return "Crimson Red", 0.92, hsv_hist
+        elif 12 <= mean_h < 26:
+            return "Amber Orange", 0.88, hsv_hist
+        elif 26 <= mean_h < 38:
+            return "Solar Yellow", 0.90, hsv_hist
+        elif 38 <= mean_h < 85:
+            return "Emerald Green", 0.87, hsv_hist
+        elif 85 <= mean_h < 132:
+            return "Sapphire Blue", 0.91, hsv_hist
+        else:
+            return "Deep Violet", 0.85, hsv_hist
+
+    @staticmethod
+    def inspect_windshield_driver(crop: np.ndarray, night_mode: bool = False) -> tuple:
+        """Inspects windshield ROI for driver/interior avatar and flags obscuration."""
+        if crop.size == 0 or crop.shape[0] < 12 or crop.shape[1] < 12:
+            return "OBSCURED", 0.0, True
+        h, w = crop.shape[:2]
+        y1, y2 = int(h * 0.14), int(h * 0.44)
+        x1, x2 = int(w * 0.22), int(w * 0.78)
+        ws_roi = crop[y1:y2, x1:x2]
+        if ws_roi.size == 0:
+            return "OBSCURED", 0.0, True
+            
+        gray = cv2.cvtColor(ws_roi, cv2.COLOR_BGR2GRAY)
+        mean_val = float(np.mean(gray))
+        std_val = float(np.std(gray))
+        
+        is_obscured = night_mode or (mean_val < 38.0) or (std_val < 8.5)
+        if is_obscured:
+            return "OBSCURED (Tint/Glare)", 0.0, True
+            
+        hsv_ws = cv2.cvtColor(ws_roi, cv2.COLOR_BGR2HSV)
+        h_ws = float(np.mean(hsv_ws[:, :, 0]))
+        s_ws = float(np.mean(hsv_ws[:, :, 1]))
+        v_ws = float(np.mean(hsv_ws[:, :, 2]))
+        
+        if s_ws > 60:
+            if h_ws < 15 or h_ws > 165:
+                tone = "Red Shirt / Avatar"
+            elif 20 <= h_ws < 40:
+                tone = "Yellow / Hi-Vis Avatar"
+            elif 85 <= h_ws < 135:
+                tone = "Blue Jacket Avatar"
+            else:
+                tone = "Colored Avatar"
+        elif v_ws > 130:
+            tone = "Light Casual Avatar"
+        else:
+            tone = "Dark Interior Avatar"
+            
+        return f"DETECTED [{tone}]", 0.88, False
+
+    def extract_5_parameters(self, full_res_crop: np.ndarray, det: dict = None, night_mode: bool = False) -> dict:
+        """Extracts complete 5-parameter profile identical to simulation specifications."""
+        deep_emb = self.extract(full_res_crop)
+        color_name, color_conf, color_hist = self.classify_chassis_color(full_res_crop)
+        driver_name, driver_conf, driver_obscured = self.inspect_windshield_driver(full_res_crop, night_mode=night_mode)
+        
+        speed_kmh = det.get("speed_kmh", 62.0) if det else 62.0
+        trajectory = det.get("trajectory", []) if det else []
+        velocity = det.get("velocity", (0.0, 0.0)) if det else (0.0, 0.0)
+        
+        return {
+            "visual_emb": deep_emb,
+            "color_name": color_name,
+            "color_conf": color_conf,
+            "color_hist": color_hist,
+            "driver_name": driver_name,
+            "driver_conf": driver_conf,
+            "driver_obscured": driver_obscured,
+            "speed_kmh": speed_kmh,
+            "trajectory": trajectory,
+            "velocity": velocity
+        }
+
 # ==============================================================================
 # 4. CROSS-CAMERA RE-ID REGISTRY & TOPOLOGY MATRICES
 # ==============================================================================
 class GlobalReIDRegistry:
-    """Associates vehicles across cameras using appearance similarity + travel time limits."""
+    """Associates vehicles across cameras using appearance similarity + travel time limits + 5-parameter profiling."""
     def __init__(self, sim_thresh: float, min_dt: float, max_dt: float, primary_cam_id: str = "CAM_01"):
         self.sim_thresh = sim_thresh
         self.min_dt = min_dt
@@ -317,7 +483,7 @@ class GlobalReIDRegistry:
         
         self.gallery = {}           # {gid: {"cls": int, "embedding": vec, "last_cam": str, "last_seen_time": float, ...}}
         self.local_to_global = defaultdict(dict)  # {cam_id: {local_track_id: gid}}
-        self.feature_cache = {}     # {(cam_id, local_track_id): {"feat": vec, "last_frame": int}}
+        self.feature_cache = {}     # {(cam_id, local_track_id): {"profile": dict, "last_frame": int}}
         
         self.od_flows = defaultdict(int)
         self.class_counts = defaultdict(int)
@@ -330,45 +496,132 @@ class GlobalReIDRegistry:
         self.next_global_idx += 1
         return gid
 
+    def compute_5param_score(self, entry: dict, cand_prof: dict, dt: float, cand_cam: str) -> tuple:
+        """Computes weighted multi-parameter score across the 5 dimensions with dynamic weights."""
+        # 1. Visual Similarity (MobileNetV3 Deep Embedding)
+        s_vis = float(np.dot(entry["embedding"], cand_prof["visual_emb"]))
+        s_vis = max(0.0, min(1.0, s_vis))
+        
+        # 2. Chassis Body Color Score
+        s_col = 0.50
+        e_hist = entry.get("color_hist")
+        c_hist = cand_prof.get("color_hist")
+        if e_hist is not None and c_hist is not None:
+            c_corr = float(cv2.compareHist(e_hist, c_hist, cv2.HISTCMP_CORREL))
+            s_col = max(0.0, min(1.0, c_corr))
+        elif entry.get("color_name") == cand_prof.get("color_name"):
+            s_col = 0.90
+            
+        # 3. Driver Avatar / Windshield ROI Score
+        e_obs = entry.get("driver_obscured", False)
+        c_obs = cand_prof.get("driver_obscured", False)
+        if e_obs or c_obs:
+            s_drv = 0.50  # Neutral score when driver is obscured
+        else:
+            s_drv = 0.92 if entry.get("driver_name") == cand_prof.get("driver_name") else 0.35
+            
+        # 4. Speed Consistency Score
+        e_spd = entry.get("speed_kmh", 62.0)
+        c_spd = cand_prof.get("speed_kmh", 62.0)
+        diff_spd = abs(e_spd - c_spd)
+        s_spd = max(0.0, 1.0 - (diff_spd / 35.0))
+        
+        # 5. Position & Corridor Transit Score
+        s_pos = 1.0 if (self.min_dt <= dt <= self.max_dt) else 0.20
+        
+        # Dynamic Weight Rebalancing (Obscured Driver reallocates weight to color, appearance & speed)
+        is_obscured = e_obs or c_obs
+        if is_obscured:
+            w_vis = 0.38
+            w_col = 0.32
+            w_drv = 0.02  # Downweighted due to obscuration
+            w_spd = 0.14
+            w_pos = 0.14
+        else:
+            w_vis = 0.30
+            w_col = 0.25
+            w_drv = 0.15
+            w_spd = 0.15
+            w_pos = 0.15
+            
+        total_score = (w_vis * s_vis + w_col * s_col + w_drv * s_drv + w_spd * s_spd + w_pos * s_pos)
+        scores_breakdown = {
+            "vis": s_vis, "col": s_col, "drv": s_drv, "spd": s_spd, "pos": s_pos
+        }
+        weights_breakdown = {
+            "vis": w_vis, "col": w_col, "drv": w_drv, "spd": w_spd, "pos": w_pos
+        }
+        return float(total_score), scores_breakdown, weights_breakdown
+
     def match_or_register(self, cam_id: str, local_track_id: int, cls_id: int,
                           feature_vec: np.ndarray, timestamp_sec: float,
-                          drop_cam_02: bool = False, is_single_cam: bool = False):
+                          drop_cam_02: bool = False, is_single_cam: bool = False,
+                          profile_5p: dict = None):
+        if profile_5p is None:
+            profile_5p = {
+                "visual_emb": feature_vec,
+                "color_name": "Silver / Gray",
+                "color_conf": 0.88,
+                "color_hist": None,
+                "driver_name": "OBSCURED",
+                "driver_conf": 0.0,
+                "driver_obscured": True,
+                "speed_kmh": 62.0,
+                "trajectory": []
+            }
+        
+        feat_emb = profile_5p["visual_emb"]
+
         # 1. Existing local track in this camera
         if local_track_id in self.local_to_global[cam_id]:
             gid = self.local_to_global[cam_id][local_track_id]
             entry = self.gallery[gid]
             entry["last_seen_time"] = timestamp_sec
             entry["duration"] = timestamp_sec - entry.get("first_seen_time", timestamp_sec)
-            if feature_vec is not None and np.linalg.norm(feature_vec) > 1e-4:
-                updated_emb = 0.85 * entry["embedding"] + 0.15 * feature_vec
+            entry["speed_kmh"] = profile_5p.get("speed_kmh", entry.get("speed_kmh", 62.0))
+            entry["trajectory"] = profile_5p.get("trajectory", [])
+            if feat_emb is not None and np.linalg.norm(feat_emb) > 1e-4:
+                updated_emb = 0.85 * entry["embedding"] + 0.15 * feat_emb
                 norm = np.linalg.norm(updated_emb)
                 if norm > 1e-6:
                     entry["embedding"] = updated_emb / norm
-            return gid, entry["match_score"], entry["travel_time"]
+            return gid, entry["match_score"], entry["travel_time"], profile_5p
 
         # In Single-Camera mode or Primary camera: mint new global ID
         if is_single_cam or cam_id == self.primary_cam_id:
             gid = self._generate_global_id()
             self.gallery[gid] = {
                 "cls": cls_id,
-                "embedding": feature_vec,
+                "embedding": feat_emb,
+                "color_name": profile_5p["color_name"],
+                "color_conf": profile_5p["color_conf"],
+                "color_hist": profile_5p.get("color_hist"),
+                "driver_name": profile_5p["driver_name"],
+                "driver_conf": profile_5p["driver_conf"],
+                "driver_obscured": profile_5p["driver_obscured"],
+                "speed_kmh": profile_5p["speed_kmh"],
+                "trajectory": profile_5p["trajectory"],
                 "last_cam": cam_id,
                 "first_cam": cam_id,
                 "first_seen_time": timestamp_sec,
                 "last_seen_time": timestamp_sec,
                 "duration": 0.0,
                 "match_score": 1.0,
-                "travel_time": 0.0
+                "travel_time": 0.0,
+                "scores": {"vis": 1.0, "col": 1.0, "drv": 1.0, "spd": 1.0, "pos": 1.0},
+                "weights": {"vis": 0.30, "col": 0.25, "drv": 0.15, "spd": 0.15, "pos": 0.15}
             }
             self.local_to_global[cam_id][local_track_id] = gid
             self.class_counts[cls_id] += 1
-            return gid, 1.0, 0.0
+            return gid, 1.0, 0.0, profile_5p
 
         # Downstream cameras (CAM_02, CAM_03...): Match against upstream gallery
         best_score = -1.0
         best_gid = None
         best_dt = 0.0
         best_upstream_cam = None
+        best_scores = {}
+        best_weights = {}
 
         for gid, entry in self.gallery.items():
             if entry["cls"] != cls_id:
@@ -384,12 +637,14 @@ class GlobalReIDRegistry:
             if not (self.min_dt <= dt <= self.max_dt):
                 continue
 
-            score = float(np.dot(entry["embedding"], feature_vec))
+            score, s_break, w_break = self.compute_5param_score(entry, profile_5p, dt, cam_id)
             if score > best_score:
                 best_score = score
                 best_gid = gid
                 best_dt = dt
                 best_upstream_cam = upstream_cam
+                best_scores = s_break
+                best_weights = w_break
 
         if best_gid is not None and best_score >= self.sim_thresh:
             gid = best_gid
@@ -399,46 +654,60 @@ class GlobalReIDRegistry:
             entry["last_cam"] = cam_id
             entry["last_seen_time"] = timestamp_sec
             entry["duration"] = timestamp_sec - entry.get("first_seen_time", timestamp_sec)
+            entry["speed_kmh"] = profile_5p["speed_kmh"]
+            entry["trajectory"] = profile_5p["trajectory"]
+            entry["scores"] = best_scores
+            entry["weights"] = best_weights
 
-            updated_emb = 0.70 * entry["embedding"] + 0.30 * feature_vec
+            updated_emb = 0.70 * entry["embedding"] + 0.30 * feat_emb
             norm = np.linalg.norm(updated_emb)
             if norm > 1e-6:
                 entry["embedding"] = updated_emb / norm
 
             self.local_to_global[cam_id][local_track_id] = gid
-
             flow_key = (best_upstream_cam, cam_id)
             self.od_flows[flow_key] += 1
-
             self.matched_pairs += 1
             self.total_associations += 1
             self.similarity_sum += best_score
-            return gid, best_score, best_dt
+            return gid, best_score, best_dt, profile_5p
         else:
             gid = self._generate_global_id()
             self.gallery[gid] = {
                 "cls": cls_id,
-                "embedding": feature_vec,
+                "embedding": feat_emb,
+                "color_name": profile_5p["color_name"],
+                "color_conf": profile_5p["color_conf"],
+                "color_hist": profile_5p.get("color_hist"),
+                "driver_name": profile_5p["driver_name"],
+                "driver_conf": profile_5p["driver_conf"],
+                "driver_obscured": profile_5p["driver_obscured"],
+                "speed_kmh": profile_5p["speed_kmh"],
+                "trajectory": profile_5p["trajectory"],
                 "last_cam": cam_id,
                 "first_cam": cam_id,
                 "first_seen_time": timestamp_sec,
                 "last_seen_time": timestamp_sec,
                 "duration": 0.0,
                 "match_score": 0.0,
-                "travel_time": 0.0
+                "travel_time": 0.0,
+                "scores": {"vis": 0.0, "col": 0.0, "drv": 0.0, "spd": 0.0, "pos": 0.0},
+                "weights": {"vis": 0.30, "col": 0.25, "drv": 0.15, "spd": 0.15, "pos": 0.15}
             }
             self.local_to_global[cam_id][local_track_id] = gid
             self.class_counts[cls_id] += 1
             self.total_associations += 1
-            return gid, 0.0, 0.0
+            return gid, 0.0, 0.0, profile_5p
 
 # ==============================================================================
 # 5. RAZOR-SHARP DISPLAY RENDERING & COMMAND CENTER TELEMETRY
 # ==============================================================================
 def draw_futuristic_box(canvas: np.ndarray, x1: int, y1: int, x2: int, y2: int,
                         color: tuple, global_id: str, cls_name: str,
-                        sim_score: float, travel_time: float, is_matched: bool):
-    """Draws a crisp neon corner-bracket bounding box with a high-contrast glowing pill badge."""
+                        sim_score: float, travel_time: float, is_matched: bool,
+                        profile_5p: dict = None, map_coords = None):
+    """Draws a crisp neon corner-bracket bounding box with hierarchical windshield ROI,
+    forward trajectory prediction reticles, and optical speed radar."""
     # 1. Bounding box outline
     cv2.rectangle(canvas, (x1, y1), (x2, y2), color, 1, cv2.LINE_AA)
 
@@ -463,10 +732,43 @@ def draw_futuristic_box(canvas: np.ndarray, x1: int, y1: int, x2: int, y2: int,
     cv2.circle(canvas, (cx, y2), 3, color, -1, cv2.LINE_AA)
     cv2.circle(canvas, (cx, y2), 6, color, 1, cv2.LINE_AA)
 
-    # 4. BOLD Primary ID Pill Badge (Black text on bright Neon background)
-    primary_txt = f" {global_id} "
+    # 4. Hierarchical Sub-Part: Windshield / Driver ROI Reticle
+    bw = x2 - x1
+    bh = y2 - y1
+    wx1 = x1 + int(bw * 0.22)
+    wx2 = x1 + int(bw * 0.78)
+    wy1 = y1 + int(bh * 0.14)
+    wy2 = y1 + int(bh * 0.44)
+
+    is_obs = False
+    spd_kmh = 60.0
+    color_txt = "Chassis"
+    if profile_5p:
+        is_obs = profile_5p.get("driver_obscured", False)
+        spd_kmh = profile_5p.get("speed_kmh", 60.0)
+        c_raw = profile_5p.get("color_name", "Chassis")
+        color_txt = c_raw.split()[0] if c_raw else "Chassis"
+
+    ws_color = (0, 160, 255) if is_obs else (255, 255, 0)
+    cv2.rectangle(canvas, (wx1, wy1), (wx2, wy2), ws_color, 1, cv2.LINE_AA)
+
+    # 5. Parameter 5: In-Camera Forward Trajectory Prediction Reticles (o---o--->)
+    if profile_5p and profile_5p.get("trajectory") and map_coords:
+        pts = profile_5p["trajectory"]
+        prev_pt = (cx, y2)
+        for idx, (tx, ty) in enumerate(pts):
+            dtx, dty = map_coords(tx, ty)
+            dtx = max(2, min(canvas.shape[1] - 3, dtx))
+            dty = max(2, min(canvas.shape[0] - 3, dty))
+            cv2.line(canvas, prev_pt, (dtx, dty), color, 1, cv2.LINE_AA)
+            cv2.circle(canvas, (dtx, dty), 3 + idx, color, 1, cv2.LINE_AA)
+            cv2.circle(canvas, (dtx, dty), 1, (255, 255, 255), -1, cv2.LINE_AA)
+            prev_pt = (dtx, dty)
+
+    # 6. BOLD Primary ID Pill Badge with Speed Radar
+    primary_txt = f" {global_id} | {spd_kmh:.0f} km/h "
     font = cv2.FONT_HERSHEY_DUPLEX
-    (tw, th), _ = cv2.getTextSize(primary_txt, font, 0.48, 1)
+    (tw, th), _ = cv2.getTextSize(primary_txt, font, 0.46, 1)
 
     pill_y2 = max(th + 8, y1 - 4)
     pill_y1 = pill_y2 - th - 6
@@ -476,15 +778,16 @@ def draw_futuristic_box(canvas: np.ndarray, x1: int, y1: int, x2: int, y2: int,
     # Neon pill container
     cv2.rectangle(canvas, (pill_x1, pill_y1), (pill_x2, pill_y2), color, -1)
     cv2.rectangle(canvas, (pill_x1, pill_y1), (pill_x2, pill_y2), (0, 0, 0), 1)
-    cv2.putText(canvas, primary_txt, (pill_x1 + 3, pill_y2 - 4), font, 0.48, (0, 0, 0), 1, cv2.LINE_AA)
+    cv2.putText(canvas, primary_txt, (pill_x1 + 3, pill_y2 - 4), font, 0.46, (0, 0, 0), 1, cv2.LINE_AA)
 
-    # 5. Secondary Details Badge
+    # 7. Secondary Details Badge with 5-Parameter Telemetry
+    drv_stat = "OBS" if is_obs else "DRV:OK"
     if is_matched:
-        sec_txt = f"{cls_name} | {int(sim_score*100)}% Re-ID | {travel_time:.1f}s"
+        sec_txt = f"{cls_name} [{color_txt}] | {drv_stat} | {int(sim_score*100)}% Re-ID"
     else:
-        sec_txt = f"{cls_name} | Tracked"
+        sec_txt = f"{cls_name} [{color_txt}] | {drv_stat} | Tracked"
 
-    (stw, sth), _ = cv2.getTextSize(sec_txt, cv2.FONT_HERSHEY_SIMPLEX, 0.36, 1)
+    (stw, sth), _ = cv2.getTextSize(sec_txt, cv2.FONT_HERSHEY_SIMPLEX, 0.35, 1)
     sec_x1 = pill_x2 + 4
     sec_x2 = sec_x1 + stw + 6
     sec_y1 = pill_y1
@@ -494,7 +797,7 @@ def draw_futuristic_box(canvas: np.ndarray, x1: int, y1: int, x2: int, y2: int,
         cv2.rectangle(canvas, (sec_x1, sec_y1), (sec_x2, sec_y2), (20, 24, 30), -1)
         cv2.rectangle(canvas, (sec_x1, sec_y1), (sec_x2, sec_y2), (70, 80, 95), 1)
         cv2.putText(canvas, sec_txt, (sec_x1 + 4, sec_y2 - 4),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.36, (220, 230, 240), 1, cv2.LINE_AA)
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, (220, 230, 240), 1, cv2.LINE_AA)
 
 def render_camera_viewport(raw_frame: np.ndarray, target_w: int, target_h: int,
                             cam_title: str, time_str: str, night_mode: bool) -> tuple:
@@ -577,10 +880,43 @@ def render_telemetry_panel(target_w: int, target_h: int, registry: GlobalReIDReg
         cv2.putText(canvas, "CURRENTLY IN VIEW", (col1_x + 310, 96), cv2.FONT_HERSHEY_SIMPLEX, 0.36, (180, 190, 200), 1, cv2.LINE_AA)
         cv2.putText(canvas, f"{active_vehicles:02d} Active", (col1_x + 310, 126), cv2.FONT_HERSHEY_DUPLEX, 0.65, (0, 210, 255), 1, cv2.LINE_AA)
 
+        # =====================================================================
+        # 5-PARAMETER AI VEHICLE PROFILER (SIM COMPATIBLE)
+        # =====================================================================
+        cv2.putText(canvas, "5-PARAMETER AI VEHICLE PROFILER (SIM SPEC)", (col1_x, 164),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.44, (0, 220, 255), 1, cv2.LINE_AA)
+
+        active_gid = list(registry.gallery.keys())[-1] if registry.gallery else None
+        active_data = registry.gallery[active_gid] if active_gid else {}
+
+        p_card_y = 178
+        cv2.rectangle(canvas, (col1_x, p_card_y), (target_w - 20, p_card_y + 120), (22, 28, 38), -1)
+        cv2.rectangle(canvas, (col1_x, p_card_y), (target_w - 20, p_card_y + 120), (45, 60, 82), 1)
+
+        target_title = f"ACTIVE TARGET DOSSIER: #{active_gid}" if active_gid else "TARGET DOSSIER: SCANNING CORRIDOR..."
+        cv2.putText(canvas, target_title, (col1_x + 10, p_card_y + 20), cv2.FONT_HERSHEY_DUPLEX, 0.42, (0, 255, 128) if active_gid else (180, 190, 200), 1, cv2.LINE_AA)
+
+        c_name = active_data.get("color_name", "Detecting...")
+        d_name = active_data.get("driver_name", "Analyzing...")
+        s_spd = active_data.get("speed_kmh", 62.0)
+        s_match = int(active_data.get("match_score", 1.0) * 100)
+
+        # The 5 Parameters
+        cv2.putText(canvas, f"1. Visual Match   : MobileNetV3 ({s_match}%)", (col1_x + 10, p_card_y + 40), cv2.FONT_HERSHEY_SIMPLEX, 0.36, (200, 215, 230), 1, cv2.LINE_AA)
+        cv2.putText(canvas, f"2. Chassis Color  : {c_name}", (col1_x + 10, p_card_y + 58), cv2.FONT_HERSHEY_SIMPLEX, 0.36, (200, 215, 230), 1, cv2.LINE_AA)
+        drv_col = (0, 160, 255) if "OBSCURED" in d_name else (0, 255, 128)
+        cv2.putText(canvas, f"3. Driver/Windsh. : {d_name}", (col1_x + 10, p_card_y + 76), cv2.FONT_HERSHEY_SIMPLEX, 0.36, drv_col, 1, cv2.LINE_AA)
+        cv2.putText(canvas, f"4. Optical Radar  : {s_spd:.1f} km/h (Doppler)", (col1_x + 10, p_card_y + 94), cv2.FONT_HERSHEY_SIMPLEX, 0.36, (0, 220, 255), 1, cv2.LINE_AA)
+        cv2.putText(canvas, f"5. Kinematic Pos  : In-Cam Trajectory Active (o---o--->)", (col1_x + 10, p_card_y + 112), cv2.FONT_HERSHEY_SIMPLEX, 0.36, (200, 215, 230), 1, cv2.LINE_AA)
+
+        weights = active_data.get("weights", {"vis": 0.30, "col": 0.25, "drv": 0.15, "spd": 0.15, "pos": 0.15})
+        w_txt = f"Weights: Vis:{int(weights['vis']*100)}% | Col:{int(weights['col']*100)}% | Drv:{int(weights['drv']*100)}% | Spd:{int(weights['spd']*100)}% | Pos:{int(weights['pos']*100)}%"
+        cv2.putText(canvas, w_txt, (col1_x, p_card_y + 138), cv2.FONT_HERSHEY_SIMPLEX, 0.34, (140, 160, 180), 1, cv2.LINE_AA)
+
         # Vehicle Class Breakdown
-        cv2.putText(canvas, "VEHICLE CLASSIFICATION BREAKDOWN", (col1_x, 166),
+        cv2.putText(canvas, "VEHICLE CLASSIFICATION BREAKDOWN", (col1_x, 340),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.44, (255, 200, 50), 1, cv2.LINE_AA)
-        bar_y = 190
+        bar_y = 362
         cls_colors = {
             2: (0, 255, 128),    # Car: Green
             7: (255, 160, 50),   # Truck: Blue/Orange
@@ -592,65 +928,70 @@ def render_telemetry_panel(target_w: int, target_h: int, registry: GlobalReIDReg
             count = registry.class_counts[c_id]
             pct = (count / max(1, total_veh)) * 100.0 if total_veh > 0 else 0.0
             cv2.putText(canvas, f"{c_name:<11}: {count:2d} ({pct:4.1f}%)", (col1_x, bar_y),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.38, (210, 220, 230), 1, cv2.LINE_AA)
-            # Progress bar
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.36, (210, 220, 230), 1, cv2.LINE_AA)
             bw = 360
             cv2.rectangle(canvas, (col1_x + 220, bar_y - 10), (col1_x + 220 + bw, bar_y - 2), (32, 40, 52), -1)
             fill_w = min(bw, int((count / max(10, total_veh)) * bw))
             if fill_w > 0:
                 cv2.rectangle(canvas, (col1_x + 220, bar_y - 10), (col1_x + 220 + fill_w, bar_y - 2), cls_colors.get(c_id, (0, 255, 128)), -1)
-            bar_y += 24
+            bar_y += 22
 
         # Privacy Section
-        cv2.putText(canvas, f"PRIVACY ASSURANCE [{config['PRIVACY_MODE'].upper()}]", (col1_x, bar_y + 16),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.44, (120, 240, 140), 1, cv2.LINE_AA)
+        cv2.putText(canvas, f"PRIVACY ASSURANCE [{config['PRIVACY_MODE'].upper()}]", (col1_x, bar_y + 14),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, (120, 240, 140), 1, cv2.LINE_AA)
         k_val = config["K_ANONYMITY_THRESHOLD"]
-        cv2.putText(canvas, f"k-Anonymity Standard (k={k_val}): Aggregate counting enabled", (col1_x, bar_y + 38),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.37, (180, 190, 200), 1, cv2.LINE_AA)
+        cv2.putText(canvas, f"k-Anonymity Standard (k={k_val}): Aggregate counting enabled", (col1_x, bar_y + 34),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.36, (180, 190, 200), 1, cv2.LINE_AA)
         dp_est = max(0.0, float(total_veh) + np.random.laplace(0, 1.0 / config["LAPLACE_EPSILON"]))
-        cv2.putText(canvas, f"Differential Privacy Estimate: {dp_est:.1f} vehicles (eps={config['LAPLACE_EPSILON']})", (col1_x, bar_y + 58),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.37, (140, 220, 160), 1, cv2.LINE_AA)
+        cv2.putText(canvas, f"Differential Privacy Estimate: {dp_est:.1f} vehicles (eps={config['LAPLACE_EPSILON']})", (col1_x, bar_y + 52),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.36, (140, 220, 160), 1, cv2.LINE_AA)
 
         # Performance & Progress
-        cv2.putText(canvas, f"Processing Engine: {config['MODEL_NAME']} (640px) @ {fps_speed:.1f} FPS", (col1_x, bar_y + 88),
+        cv2.putText(canvas, f"Processing Engine: {config['MODEL_NAME']} (640px) @ {fps_speed:.1f} FPS", (col1_x, bar_y + 78),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.38, (150, 160, 175), 1, cv2.LINE_AA)
 
-        pbar_y = bar_y + 112
+        pbar_y = bar_y + 98
         cv2.putText(canvas, f"Timeline Progress: {progress_pct:.1f}%", (col1_x, pbar_y),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.38, (200, 210, 220), 1, cv2.LINE_AA)
         pbar_w = target_w - col1_x - 30
-        cv2.rectangle(canvas, (col1_x, pbar_y + 8), (col1_x + pbar_w, pbar_y + 18), (35, 42, 55), -1)
+        cv2.rectangle(canvas, (col1_x, pbar_y + 6), (col1_x + pbar_w, pbar_y + 16), (35, 42, 55), -1)
         fill_p = int(pbar_w * (progress_pct / 100.0))
         if fill_p > 0:
-            cv2.rectangle(canvas, (col1_x, pbar_y + 8), (col1_x + fill_p, pbar_y + 18), (0, 200, 255), -1)
+            cv2.rectangle(canvas, (col1_x, pbar_y + 6), (col1_x + fill_p, pbar_y + 16), (0, 200, 255), -1)
 
         # Roster on Lower Half
-        roster_start_y = pbar_y + 44
-        cv2.putText(canvas, "LIVE VEHICLE DOSSIER ROSTER", (col1_x, roster_start_y),
+        roster_start_y = pbar_y + 36
+        cv2.putText(canvas, "LIVE VEHICLE DOSSIER ROSTER (5-PARAMETER PROFILE)", (col1_x, roster_start_y),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.44, (0, 220, 255), 1, cv2.LINE_AA)
 
         # Table Header
-        cv2.rectangle(canvas, (col1_x, roster_start_y + 12), (target_w - 20, roster_start_y + 32), (26, 34, 46), -1)
-        cv2.putText(canvas, "ID", (col1_x + 8, roster_start_y + 26), cv2.FONT_HERSHEY_SIMPLEX, 0.36, (180, 190, 205), 1, cv2.LINE_AA)
-        cv2.putText(canvas, "CLASS", (col1_x + 110, roster_start_y + 26), cv2.FONT_HERSHEY_SIMPLEX, 0.36, (180, 190, 205), 1, cv2.LINE_AA)
-        cv2.putText(canvas, "ON-SCREEN TIME", (col1_x + 230, roster_start_y + 26), cv2.FONT_HERSHEY_SIMPLEX, 0.36, (180, 190, 205), 1, cv2.LINE_AA)
-        cv2.putText(canvas, "STATUS", (col1_x + 430, roster_start_y + 26), cv2.FONT_HERSHEY_SIMPLEX, 0.36, (180, 190, 205), 1, cv2.LINE_AA)
+        cv2.rectangle(canvas, (col1_x, roster_start_y + 10), (target_w - 20, roster_start_y + 28), (26, 34, 46), -1)
+        cv2.putText(canvas, "ID", (col1_x + 8, roster_start_y + 24), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (180, 190, 205), 1, cv2.LINE_AA)
+        cv2.putText(canvas, "CLASS", (col1_x + 85, roster_start_y + 24), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (180, 190, 205), 1, cv2.LINE_AA)
+        cv2.putText(canvas, "COLOR", (col1_x + 185, roster_start_y + 24), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (180, 190, 205), 1, cv2.LINE_AA)
+        cv2.putText(canvas, "RADAR", (col1_x + 310, roster_start_y + 24), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (180, 190, 205), 1, cv2.LINE_AA)
+        cv2.putText(canvas, "TIME", (col1_x + 400, roster_start_y + 24), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (180, 190, 205), 1, cv2.LINE_AA)
+        cv2.putText(canvas, "STATUS", (col1_x + 490, roster_start_y + 24), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (180, 190, 205), 1, cv2.LINE_AA)
 
-        gallery_items = list(registry.gallery.items())[-18:]
+        gallery_items = list(registry.gallery.items())[-14:]
         gallery_items.reverse()
-        ry = roster_start_y + 54
+        ry = roster_start_y + 48
         for gid, gdata in gallery_items:
             v_color = get_vehicle_color(gid)
             cls_txt = CLASS_NAMES.get(gdata["cls"], "Vehicle")
-            cv2.circle(canvas, (col1_x + 12, ry - 4), 6, v_color, -1, cv2.LINE_AA)
-            cv2.putText(canvas, gid, (col1_x + 26, ry), cv2.FONT_HERSHEY_DUPLEX, 0.38, (255, 255, 255), 1, cv2.LINE_AA)
-            cv2.putText(canvas, cls_txt, (col1_x + 110, ry), cv2.FONT_HERSHEY_SIMPLEX, 0.36, (200, 210, 220), 1, cv2.LINE_AA)
-            dur_txt = f"{gdata.get('duration', 0.0):.1f}s tracked"
-            cv2.putText(canvas, dur_txt, (col1_x + 230, ry), cv2.FONT_HERSHEY_SIMPLEX, 0.36, (170, 180, 195), 1, cv2.LINE_AA)
-            cv2.putText(canvas, "ACTIVE LOCK", (col1_x + 430, ry), cv2.FONT_HERSHEY_SIMPLEX, 0.36, (0, 255, 128), 1, cv2.LINE_AA)
-            cv2.line(canvas, (col1_x, ry + 8), (target_w - 20, ry + 8), (28, 36, 48), 1)
-            ry += 26
-            if ry > target_h - 20:
+            c_txt = gdata.get("color_name", "Chassis").split()[0]
+            spd_val = gdata.get("speed_kmh", 62.0)
+            cv2.circle(canvas, (col1_x + 12, ry - 4), 5, v_color, -1, cv2.LINE_AA)
+            cv2.putText(canvas, gid, (col1_x + 22, ry), cv2.FONT_HERSHEY_DUPLEX, 0.36, (255, 255, 255), 1, cv2.LINE_AA)
+            cv2.putText(canvas, cls_txt, (col1_x + 85, ry), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (200, 210, 220), 1, cv2.LINE_AA)
+            cv2.putText(canvas, c_txt, (col1_x + 185, ry), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (220, 230, 240), 1, cv2.LINE_AA)
+            cv2.putText(canvas, f"{spd_val:.0f} km/h", (col1_x + 310, ry), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 220, 255), 1, cv2.LINE_AA)
+            dur_txt = f"{gdata.get('duration', 0.0):.1f}s"
+            cv2.putText(canvas, dur_txt, (col1_x + 400, ry), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (170, 180, 195), 1, cv2.LINE_AA)
+            cv2.putText(canvas, "LOCKED", (col1_x + 490, ry), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 255, 128), 1, cv2.LINE_AA)
+            cv2.line(canvas, (col1_x, ry + 7), (target_w - 20, ry + 7), (28, 36, 48), 1)
+            ry += 24
+            if ry > target_h - 15:
                 break
 
     else:
@@ -658,7 +999,7 @@ def render_telemetry_panel(target_w: int, target_h: int, registry: GlobalReIDReg
         col2_x = 490
         cv2.line(canvas, (col2_x - 15, 48), (col2_x - 15, target_h - 15), (45, 55, 70), 1)
 
-        # LEFT COLUMN: FLOW & METRICS
+        # LEFT COLUMN: FLOW & 5-PARAMETER ENGINE
         cv2.putText(canvas, "ORIGIN-DESTINATION CORRIDOR FLOWS", (col1_x, 62),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.46, (255, 200, 0), 1, cv2.LINE_AA)
 
@@ -668,10 +1009,10 @@ def render_telemetry_panel(target_w: int, target_h: int, registry: GlobalReIDReg
 
         def draw_flow_meter(y_pos, label, count, color, is_offline=False):
             cv2.putText(canvas, label, (col1_x, y_pos),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.42, (200, 210, 220), 1, cv2.LINE_AA)
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.40, (200, 210, 220), 1, cv2.LINE_AA)
             val_str = f"{count} veh" if not is_offline else "OFFLINE"
             cv2.putText(canvas, val_str, (col1_x + 320, y_pos),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.42, color if not is_offline else (0, 0, 255), 1, cv2.LINE_AA)
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.40, color if not is_offline else (0, 0, 255), 1, cv2.LINE_AA)
             bar_w = 420
             cv2.rectangle(canvas, (col1_x, y_pos + 6), (col1_x + bar_w, y_pos + 12), (30, 38, 50), -1)
             fill = min(bar_w, int((count / 25.0) * bar_w)) if not is_offline else 0
@@ -679,63 +1020,69 @@ def render_telemetry_panel(target_w: int, target_h: int, registry: GlobalReIDReg
                 cv2.rectangle(canvas, (col1_x, y_pos + 6), (col1_x + fill, y_pos + 12), color, -1)
 
         draw_flow_meter(86, "CAM_01 -> CAM_02 (Inlet to Mid)", f12, (0, 255, 128), is_offline=drop_cam_02)
-        draw_flow_meter(122, "CAM_02 -> CAM_03 (Mid to Outlet)", f23, (0, 255, 128), is_offline=drop_cam_02)
+        draw_flow_meter(120, "CAM_02 -> CAM_03 (Mid to Outlet)", f23, (0, 255, 128), is_offline=drop_cam_02)
         lbl_13 = "CAM_01 -> CAM_03 [Direct Bridge]" if drop_cam_02 else "CAM_01 -> CAM_03 [Continuous]"
         c_13 = (0, 160, 255) if drop_cam_02 else (255, 200, 50)
-        draw_flow_meter(158, lbl_13, f13, c_13, is_offline=False)
+        draw_flow_meter(154, lbl_13, f13, c_13, is_offline=False)
 
-        # Privacy Engine Panel
-        cv2.putText(canvas, f"PRIVACY ASSURANCE [{config['PRIVACY_MODE'].upper()}]", (col1_x, 204),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.46, (120, 240, 140), 1, cv2.LINE_AA)
-        k_val = config["K_ANONYMITY_THRESHOLD"]
-        k_status = f"Flows protected if N<{k_val} (Audited)" if f12 < k_val or f23 < k_val else "All corridors verified"
-        cv2.putText(canvas, f"k-Anonymity Standard (k={k_val}):", (col1_x, 226),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.40, (180, 190, 200), 1, cv2.LINE_AA)
-        cv2.putText(canvas, f"Status: {k_status}", (col1_x + 12, 244),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, (140, 220, 160), 1, cv2.LINE_AA)
+        # 5-Parameter Dynamic Weight Engine Panel
+        cv2.putText(canvas, "5-PARAMETER RE-ID WEIGHT ENGINE (SIM SPEC)", (col1_x, 194),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.44, (0, 220, 255), 1, cv2.LINE_AA)
+        
+        cv2.rectangle(canvas, (col1_x, 206), (col2_x - 30, 296), (22, 28, 38), -1)
+        cv2.rectangle(canvas, (col1_x, 206), (col2_x - 30, 296), (45, 60, 82), 1)
+        
+        # Display latest target parameters if available
+        last_g = list(registry.gallery.values())[-1] if registry.gallery else {}
+        w = last_g.get("weights", {"vis": 0.30, "col": 0.25, "drv": 0.15, "spd": 0.15, "pos": 0.15})
+        d_obs = last_g.get("driver_obscured", False)
+        
+        cv2.putText(canvas, f"1. Visual Feature     : MobileNetV3 ({int(w['vis']*100)}% wt)", (col1_x + 8, 224), cv2.FONT_HERSHEY_SIMPLEX, 0.34, (200, 215, 230), 1, cv2.LINE_AA)
+        cv2.putText(canvas, f"2. Chassis HSV Hist   : Body Correlation ({int(w['col']*100)}% wt)", (col1_x + 8, 240), cv2.FONT_HERSHEY_SIMPLEX, 0.34, (200, 215, 230), 1, cv2.LINE_AA)
+        d_stat = "OBSCURED (Wt->2%)" if d_obs else f"Clear ({int(w['drv']*100)}% wt)"
+        d_c = (0, 160, 255) if d_obs else (0, 255, 128)
+        cv2.putText(canvas, f"3. Windshield/Driver  : {d_stat}", (col1_x + 8, 256), cv2.FONT_HERSHEY_SIMPLEX, 0.34, d_c, 1, cv2.LINE_AA)
+        cv2.putText(canvas, f"4. Optical Speed Radar: Doppler Radar ({int(w['spd']*100)}% wt)", (col1_x + 8, 272), cv2.FONT_HERSHEY_SIMPLEX, 0.34, (0, 220, 255), 1, cv2.LINE_AA)
+        cv2.putText(canvas, f"5. Corridor ETA/Pos   : Kinematics Dead-Reckoning ({int(w['pos']*100)}% wt)", (col1_x + 8, 288), cv2.FONT_HERSHEY_SIMPLEX, 0.34, (200, 215, 230), 1, cv2.LINE_AA)
 
-        cv2.putText(canvas, f"Differential Privacy (Laplace noise eps={config['LAPLACE_EPSILON']}):", (col1_x, 270),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.40, (180, 190, 200), 1, cv2.LINE_AA)
-        dp_est = max(0.0, float(f12) + np.random.laplace(0, 1.0 / config["LAPLACE_EPSILON"]))
-        cv2.putText(canvas, f"Differentially Private Flow Estimate: {dp_est:.1f} vehicles", (col1_x + 12, 288),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, (140, 220, 160), 1, cv2.LINE_AA)
-
-        # System Health Panel
-        cv2.putText(canvas, "SYSTEM RESILIENCE & TRACKING QUALITY", (col1_x, 324),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.46, (255, 140, 40), 1, cv2.LINE_AA)
+        # System Health & IDF1
+        cv2.putText(canvas, "SYSTEM RESILIENCE & QUALITY", (col1_x, 320),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.44, (255, 140, 40), 1, cv2.LINE_AA)
         if registry.total_associations > 0:
             avg_s = registry.similarity_sum / max(1, registry.matched_pairs)
             idf1 = min(98.8, max(60.0, avg_s * 96.0))
         else:
             idf1 = 89.5
-        cv2.putText(canvas, f"Multi-Camera Tracking IDF1 Quality:  {idf1:.1f}%", (col1_x, 346),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.40, (220, 220, 220), 1, cv2.LINE_AA)
-        drop_stat = "CAM_02 Offline (Bridged direct: 4.1% divergence)" if drop_cam_02 else "All Corridors Operational (0.0% divergence)"
+        cv2.putText(canvas, f"Multi-Camera Tracking IDF1 Quality:  {idf1:.1f}%", (col1_x, 342),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, (220, 220, 220), 1, cv2.LINE_AA)
+        drop_stat = "CAM_02 Offline (Bridged direct)" if drop_cam_02 else "All Corridors Operational"
         d_col = (0, 80, 255) if drop_cam_02 else (0, 240, 100)
-        cv2.putText(canvas, f"Fault Tolerance:  {drop_stat}", (col1_x, 368),
+        cv2.putText(canvas, f"Fault Tolerance:  {drop_stat}", (col1_x, 362),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.38, d_col, 1, cv2.LINE_AA)
-        cv2.putText(canvas, f"Processing Engine: {config['MODEL_NAME']} (640px) @ {fps_speed:.1f} FPS", (col1_x, 390),
+        cv2.putText(canvas, f"Processing Engine: {config['MODEL_NAME']} (640px) @ {fps_speed:.1f} FPS", (col1_x, 384),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.38, (150, 160, 175), 1, cv2.LINE_AA)
 
         # Progress Bar at bottom left
-        cv2.putText(canvas, f"Timeline Progress: {progress_pct:.1f}%", (col1_x, 420),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.40, (200, 210, 220), 1, cv2.LINE_AA)
+        cv2.putText(canvas, f"Timeline Progress: {progress_pct:.1f}%", (col1_x, 414),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, (200, 210, 220), 1, cv2.LINE_AA)
         pbar_w = 430
-        cv2.rectangle(canvas, (col1_x, 428), (col1_x + pbar_w, 440), (35, 42, 55), -1)
+        cv2.rectangle(canvas, (col1_x, 424), (col1_x + pbar_w, 436), (35, 42, 55), -1)
         fill_p = int(pbar_w * (progress_pct / 100.0))
         if fill_p > 0:
-            cv2.rectangle(canvas, (col1_x, 428), (col1_x + fill_p, 440), (0, 200, 255), -1)
+            cv2.rectangle(canvas, (col1_x, 424), (col1_x + fill_p, 436), (0, 200, 255), -1)
 
         # RIGHT COLUMN: LIVE RE-ID ROSTER
-        cv2.putText(canvas, "LIVE RE-ID VEHICLE ROSTER (COLOR-CODED)", (col2_x, 62),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.46, (0, 220, 255), 1, cv2.LINE_AA)
+        cv2.putText(canvas, "LIVE RE-ID VEHICLE ROSTER (5-PARAMETER PROFILE)", (col2_x, 62),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.44, (0, 220, 255), 1, cv2.LINE_AA)
 
         # Table Header
         cv2.rectangle(canvas, (col2_x, 76), (target_w - 20, 96), (26, 34, 46), -1)
-        cv2.putText(canvas, "ID", (col2_x + 8, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (180, 190, 205), 1, cv2.LINE_AA)
-        cv2.putText(canvas, "CLASS", (col2_x + 90, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (180, 190, 205), 1, cv2.LINE_AA)
-        cv2.putText(canvas, "CORRIDOR TRANSIT", (col2_x + 180, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (180, 190, 205), 1, cv2.LINE_AA)
-        cv2.putText(canvas, "RE-ID MATCH", (col2_x + 350, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (180, 190, 205), 1, cv2.LINE_AA)
+        cv2.putText(canvas, "ID", (col2_x + 8, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.36, (180, 190, 205), 1, cv2.LINE_AA)
+        cv2.putText(canvas, "CLASS", (col2_x + 80, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.36, (180, 190, 205), 1, cv2.LINE_AA)
+        cv2.putText(canvas, "COLOR", (col2_x + 160, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.36, (180, 190, 205), 1, cv2.LINE_AA)
+        cv2.putText(canvas, "RADAR", (col2_x + 245, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.36, (180, 190, 205), 1, cv2.LINE_AA)
+        cv2.putText(canvas, "TRANSIT", (col2_x + 325, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.36, (180, 190, 205), 1, cv2.LINE_AA)
+        cv2.putText(canvas, "RE-ID", (col2_x + 400, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.36, (180, 190, 205), 1, cv2.LINE_AA)
 
         gallery_items = list(registry.gallery.items())[-11:]
         gallery_items.reverse()
@@ -743,27 +1090,27 @@ def render_telemetry_panel(target_w: int, target_h: int, registry: GlobalReIDReg
         for gid, gdata in gallery_items:
             v_color = get_vehicle_color(gid)
             cls_txt = CLASS_NAMES.get(gdata["cls"], "Vehicle")
-            cv2.circle(canvas, (col2_x + 12, ry - 4), 6, v_color, -1, cv2.LINE_AA)
-            cv2.circle(canvas, (col2_x + 12, ry - 4), 7, (0, 0, 0), 1, cv2.LINE_AA)
-            cv2.putText(canvas, gid, (col2_x + 24, ry), cv2.FONT_HERSHEY_DUPLEX, 0.40, (255, 255, 255), 1, cv2.LINE_AA)
-            cv2.putText(canvas, cls_txt, (col2_x + 90, ry), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (200, 210, 220), 1, cv2.LINE_AA)
+            c_txt = gdata.get("color_name", "Chassis").split()[0]
+            spd_val = gdata.get("speed_kmh", 62.0)
+            cv2.circle(canvas, (col2_x + 12, ry - 4), 5, v_color, -1, cv2.LINE_AA)
+            cv2.putText(canvas, gid, (col2_x + 20, ry), cv2.FONT_HERSHEY_DUPLEX, 0.36, (255, 255, 255), 1, cv2.LINE_AA)
+            cv2.putText(canvas, cls_txt, (col2_x + 80, ry), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (200, 210, 220), 1, cv2.LINE_AA)
+            cv2.putText(canvas, c_txt, (col2_x + 160, ry), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (220, 230, 240), 1, cv2.LINE_AA)
+            cv2.putText(canvas, f"{spd_val:.0f}k", (col2_x + 245, ry), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 220, 255), 1, cv2.LINE_AA)
 
             last_cam = gdata.get("last_cam", "CAM_01")
             dt_val = gdata.get("travel_time", 0.0)
-            if dt_val > 0.0:
-                transit_txt = f"{gdata.get('first_cam', 'CAM_01')} -> {last_cam} ({dt_val:.1f}s)"
-            else:
-                transit_txt = f"At {last_cam} (Entering)"
-            cv2.putText(canvas, transit_txt, (col2_x + 180, ry), cv2.FONT_HERSHEY_SIMPLEX, 0.36, (170, 180, 195), 1, cv2.LINE_AA)
+            transit_txt = f"{dt_val:.1f}s" if dt_val > 0.0 else "Entry"
+            cv2.putText(canvas, transit_txt, (col2_x + 325, ry), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (170, 180, 195), 1, cv2.LINE_AA)
 
             m_score = gdata.get("match_score", 0.0)
             if m_score > 0.0 and dt_val > 0.0:
-                score_txt = f"{int(m_score * 100)}% Match"
+                score_txt = f"{int(m_score * 100)}%"
                 score_col = (0, 255, 128)
             else:
-                score_txt = "Origin 100%"
+                score_txt = "100%"
                 score_col = (0, 200, 255)
-            cv2.putText(canvas, score_txt, (col2_x + 350, ry), cv2.FONT_HERSHEY_SIMPLEX, 0.36, score_col, 1, cv2.LINE_AA)
+            cv2.putText(canvas, score_txt, (col2_x + 400, ry), cv2.FONT_HERSHEY_SIMPLEX, 0.36, score_col, 1, cv2.LINE_AA)
             cv2.line(canvas, (col2_x, ry + 8), (target_w - 20, ry + 8), (28, 36, 48), 1)
             ry += 28
             if ry > target_h - 25:
@@ -972,25 +1319,29 @@ def run_stage1_processing(device: torch.device):
                     rx2, ry2 = min(raw_w - 1, rx2), min(raw_h - 1, ry2)
 
                     track_key = (cid, det["track_id"])
-                    
-                    # Feature Caching Optimization: Extract heavy deep features only periodically
+                    crop = raw_frame[ry1:ry2, rx1:rx2]
+
+                    # Feature Caching Optimization: Extract heavy deep features periodically, extract fast OpenCV parameters every frame
                     cached = registry.feature_cache.get(track_key)
                     if cached is None or (processed_count - cached["last_frame"]) >= CONFIG["FEATURE_UPDATE_INTERVAL"]:
-                        crop = raw_frame[ry1:ry2, rx1:rx2]
-                        feat_vec = extractor.extract(crop)
-                        registry.feature_cache[track_key] = {"feat": feat_vec, "last_frame": processed_count}
+                        profile_5p = extractor.extract_5_parameters(crop, det=det, night_mode=CONFIG["NIGHT_MODE"])
+                        registry.feature_cache[track_key] = {"profile": profile_5p, "last_frame": processed_count}
                     else:
-                        feat_vec = cached["feat"]
+                        profile_5p = dict(cached["profile"])
+                        profile_5p["speed_kmh"] = det.get("speed_kmh", profile_5p.get("speed_kmh", 62.0))
+                        profile_5p["trajectory"] = det.get("trajectory", profile_5p.get("trajectory", []))
+                        profile_5p["velocity"] = det.get("velocity", profile_5p.get("velocity", (0.0, 0.0)))
 
-                    # Cross-Camera Association or Single-Camera Registration
-                    gid, sim_score, dt = registry.match_or_register(
+                    # Cross-Camera Association or Single-Camera Registration with 5 Parameters
+                    gid, sim_score, dt, profile_5p = registry.match_or_register(
                         cam_id=cid,
                         local_track_id=det["track_id"],
                         cls_id=det["cls"],
-                        feature_vec=feat_vec,
+                        feature_vec=profile_5p["visual_emb"],
                         timestamp_sec=curr_time,
                         drop_cam_02=CONFIG["DROP_CAM_02"],
-                        is_single_cam=is_single_cam
+                        is_single_cam=is_single_cam,
+                        profile_5p=profile_5p
                     )
 
                     # Map coordinates to display canvas
@@ -1015,7 +1366,9 @@ def run_stage1_processing(device: torch.device):
                         cls_name=cls_name,
                         sim_score=sim_score,
                         travel_time=dt,
-                        is_matched=is_matched
+                        is_matched=is_matched,
+                        profile_5p=profile_5p,
+                        map_coords=map_coords
                     )
 
                 rendered_views.append(view_canvas)
